@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-ai"
+version = "0.1.0"
+description = "Local-first personal assistant MVP"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+personal-ai = "personal_ai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["personal_ai*"]

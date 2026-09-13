@@ -1,0 +1,140 @@
+import json
+import math
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+from .llm import MockLLM, generate
+from .models import Context, Persona, Reply, ToolCall
+from .runtime import OperationError, run_bounded
+from .storage import Store
+from .tools import SCHEMAS, Tools
+
+
+class Assistant:
+    def __init__(self, data_dir, notes_dir, persona_path=None, provider=None,
+                 timeout=10.0, turn_timeout=30.0, max_tool_calls=4):
+        if not all(math.isfinite(value) and value > 0 for value in (timeout, turn_timeout)):
+            raise ValueError("timeout must be finite and positive")
+        if not isinstance(max_tool_calls, int) or not 1 <= max_tool_calls <= 10:
+            raise ValueError("max_tool_calls must be between 1 and 10")
+        data_input, notes_input = Path(data_dir).absolute(), Path(notes_dir).absolute()
+        if data_input.is_symlink() or notes_input.is_symlink():
+            raise ValueError("configured directories must not be symlinks")
+        data, notes = data_input.resolve(), notes_input.resolve()
+        if data == notes or data in notes.parents or notes in data.parents:
+            raise ValueError("data and notes directories must not overlap")
+        self.persona = self.load_persona(persona_path)
+        data.mkdir(parents=True, exist_ok=True, mode=0o700)
+        notes.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(data, 0o700)
+        database = data / "assistant.sqlite3"
+        if database.is_symlink():
+            raise ValueError("database must not be a symlink")
+        self.store = Store(database)
+        os.chmod(database, 0o600)
+        self.provider = provider if provider is not None else MockLLM()
+        self.timeout, self.turn_timeout, self.max_tool_calls = timeout, turn_timeout, max_tool_calls
+        try:
+            self.tools = Tools(notes, self.store, timeout)
+        except BaseException:
+            self.store.close()
+            raise
+
+    @staticmethod
+    def load_persona(path):
+        if path is None:
+            return Persona("Amadeus", "簡潔な日本語で答える。ツールの成否は実行結果に従う。")
+        raw = Path(path).read_text(encoding="utf-8")
+        if len(raw) > 16000:
+            raise ValueError("persona too large")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {"name", "instructions"}:
+            raise ValueError("persona requires name and instructions")
+        if not all(isinstance(item, str) and item.strip() for item in value.values()):
+            raise ValueError("persona fields must be nonempty strings")
+        return Persona(**value)
+
+    def close(self):
+        self.store.close()
+
+    def memory(self, action, content=None, memory_id=None):
+        # Only explicit commands call this API. Memory is not an LLM tool.
+        operation = self.store.start_operation("memory_" + action,
+                                               {"memory_id": memory_id})
+        try:
+            result = self.store.memories() if action == "list" else self.store.memory(
+                action, content, memory_id
+            )
+            self.store.finish_operation(operation, "success")
+            return result
+        except ValueError as exc:
+            self.store.finish_operation(operation, "failed", str(exc))
+            raise
+        except sqlite3.Error:
+            # If the database itself is unavailable, the durable 'started' entry
+            # remains evidence that completion could not be recorded.
+            self.store.finish_operation(operation, "failed", "storage_failed")
+            raise
+
+    def chat(self, message):
+        if not isinstance(message, str) or not message.strip() or len(message) > 16000:
+            raise ValueError("message must contain 1 to 16000 characters")
+        deadline = time.monotonic() + self.turn_timeout
+        epoch = self.store.epoch()
+        context = Context(self.persona, self.store.memories(), self.store.history(),
+                          message, SCHEMAS)
+        self.store.message("user", message, epoch)
+        tool_count = 0
+        operation = None
+        try:
+            while True:
+                if self.store.epoch() != epoch:
+                    raise OperationError("memory_changed")
+                operation = self.store.start_operation("llm_generate")
+                reply = run_bounded(generate, (self.provider, context),
+                                    min(self.timeout, deadline - time.monotonic()))
+                if (not isinstance(reply, Reply) or not isinstance(reply.text, str)
+                        or len(reply.text) > 16000 or not isinstance(reply.calls, list)
+                        or any(not isinstance(call, ToolCall) for call in reply.calls)):
+                    raise OperationError("invalid_llm_reply")
+                self.store.finish_operation(operation, "success")
+                operation = None
+                if self.store.epoch() != epoch:
+                    raise OperationError("memory_changed")
+                if not reply.calls:
+                    if not reply.text.strip():
+                        raise OperationError("empty_llm_reply")
+                    answer = reply.text
+                    break
+                if tool_count + len(reply.calls) > self.max_tool_calls:
+                    raise OperationError("tool_limit")
+                for call in reply.calls:
+                    tool_count += 1
+                    result = self.tools.execute(call, deadline - time.monotonic())
+                    context.results.append(result)
+                    if not result.ok:
+                        # Do not let a model reinterpret failure as success.
+                        answer = "操作は成功していません: {} ({})。".format(result.name, result.error)
+                        if call.name == "create_note":
+                            answer += " 新規作成は途中まで進んだ可能性があるため、再試行前に対象を確認してください。"
+                        if any(item.ok for item in context.results):
+                            answer += " 先行する操作は完了済みです。/logs で確認できます。"
+                        break
+                else:
+                    continue
+                break
+        except OperationError as exc:
+            if operation is not None:
+                self.store.finish_operation(operation, "failed", str(exc))
+            answer = "処理を完了できませんでした ({})。".format(exc)
+            if any(item.ok for item in context.results):
+                answer += " 一部の操作は完了済みです。/logs で確認できます。"
+        except KeyboardInterrupt:
+            if operation is not None:
+                self.store.finish_operation(operation, "cancelled", "cancelled")
+            answer = "処理をキャンセルしました。実行済みの操作は /logs で確認してください。"
+        # Save into the original epoch even if another process forgot a memory.
+        self.store.message("assistant", answer, epoch)
+        return answer
