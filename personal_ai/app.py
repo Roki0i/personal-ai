@@ -5,6 +5,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .external import (EXTERNAL_NAMES, ExternalPermission, PrivacyClassification,
+                       MockWebSearchProvider, MockCalendarProvider, request_from_message,
+                       provenance)
 from .llm import MockLLM, generate
 from .models import Context, Persona, Reply, ToolCall
 from .runtime import OperationError, cancel_current, run_bounded
@@ -14,7 +17,8 @@ from .tools import SCHEMAS, Tools
 
 class Assistant:
     def __init__(self, data_dir, notes_dir, persona_path=None, provider=None,
-                 timeout=10.0, turn_timeout=30.0, max_tool_calls=4):
+                 timeout=10.0, turn_timeout=30.0, max_tool_calls=4,
+                 web_provider=None, calendar_provider=None):
         if not all(math.isfinite(value) and value > 0 for value in (timeout, turn_timeout)):
             raise ValueError("timeout must be finite and positive")
         if not isinstance(max_tool_calls, int) or not 1 <= max_tool_calls <= 10:
@@ -37,7 +41,9 @@ class Assistant:
         self.provider = provider if provider is not None else MockLLM()
         self.timeout, self.turn_timeout, self.max_tool_calls = timeout, turn_timeout, max_tool_calls
         try:
-            self.tools = Tools(notes, self.store, timeout)
+            self.tools = Tools(notes, self.store, timeout,
+                               web_provider if web_provider is not None else MockWebSearchProvider(),
+                               calendar_provider if calendar_provider is not None else MockCalendarProvider())
         except BaseException:
             self.store.close()
             raise
@@ -78,14 +84,21 @@ class Assistant:
             self.store.finish_operation(operation, "failed", "storage_failed")
             raise
 
-    def chat(self, message):
+    def chat(self, message, *, external_permission=None):
         if not isinstance(message, str) or not message.strip() or len(message) > 16000:
             raise ValueError("message must contain 1 to 16000 characters")
         deadline = time.monotonic() + self.turn_timeout
         epoch = self.store.epoch()
-        context = Context(self.persona, self.store.memories(), self.store.history(),
-                          message, SCHEMAS)
-        self.store.message("user", message, epoch)
+        request = request_from_message(message)
+        if request and external_permission is None:
+            adapter = self.tools.web_provider if request.name == "web_search" else self.tools.calendar_provider
+            # Only the built-in offline mocks have a default grant. Real adapters fail closed.
+            if type(adapter) in (MockWebSearchProvider, MockCalendarProvider):
+                external_permission = ExternalPermission(PrivacyClassification.CLOUD_SENDABLE,
+                                                         provider=adapter.provider_id)
+        context = Context(self.persona, [] if request else self.store.memories(),
+                          [] if request else self.store.history(), message, SCHEMAS)
+        self.store.message("external_user" if request else "user", message, epoch)
         tool_count = 0
         operation = None
         try:
@@ -104,15 +117,26 @@ class Assistant:
                 if self.store.epoch() != epoch:
                     raise OperationError("memory_changed")
                 if not reply.calls:
+                    if request and not context.results:
+                        raise OperationError("external_result_missing")
                     if not reply.text.strip():
                         raise OperationError("empty_llm_reply")
                     answer = reply.text
+                    sources = [source for item in context.results if item.ok and item.name in EXTERNAL_NAMES
+                               for source in provenance(item.data)]
+                    if sources:
+                        answer += "\n参照した外部結果（回答生成に提供）: " + json.dumps(sources, ensure_ascii=False)
                     break
                 if tool_count + len(reply.calls) > self.max_tool_calls:
                     raise OperationError("tool_limit")
+                if request and (context.results or len(reply.calls) != 1 or reply.calls[0] != request):
+                    denied = self.store.start_operation("external_tool_boundary")
+                    self.store.finish_operation(denied, "denied", "external_tool_chain_denied")
+                    raise OperationError("external_tool_chain_denied")
                 for call in reply.calls:
                     tool_count += 1
-                    result = self.tools.execute(call, deadline - time.monotonic())
+                    result = self.tools.execute(call, deadline - time.monotonic(),
+                                                request=request, permission=external_permission)
                     context.results.append(result)
                     if not result.ok:
                         # Do not let a model reinterpret failure as success.
@@ -137,5 +161,5 @@ class Assistant:
                 self.store.finish_operation(operation, "cancelled", "cancelled")
             answer = "処理をキャンセルしました。実行済みの操作は /logs で確認してください。"
         # Save into the original epoch even if another process forgot a memory.
-        self.store.message("assistant", answer, epoch)
+        self.store.message("external_assistant" if request else "assistant", answer, epoch)
         return answer

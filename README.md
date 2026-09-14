@@ -338,3 +338,102 @@ Piperの利用可能な音声と言語に制約があります。英語音声で
 LLMは引き続きPhase 1のmockです。自然な音声対話には本物のLLM実装が別途必要です。
 モデルは各操作で読み込むため起動遅延があり、ストリーミング応答、割込み会話、複数同時セッションは未対応です。
 常時マイク・wake word・Web検索・Calendar・PC/shell操作・daemon・自律タスクは追加していません。
+
+## Phase 3: Web・外部サービス連携基盤
+
+標準構成は完全offlineの `MockWebSearchProvider` / `MockCalendarProvider`。
+APIキー・ネットワーク・追加依存なしで利用・テストできる。
+
+```text
+PythonをWebで調べて
+/web Python
+今日の予定は？
+/calendar
+/event demo
+```
+
+テキストは `python3 -m personal_ai` で起動して上記を入力する。
+音声mock例:
+
+```sh
+python3 -m personal_ai --voice mock --mock-transcript 'PythonをWebで調べて'
+python3 -m personal_ai --voice mock --mock-transcript '今日の予定は？'
+```
+
+起動後 `/voice` → Enter。local音声でも同じ発話を使う。STT後は既存の
+`handle → Assistant.chat → LLM proposal → Tools.execute → permission → run_bounded`
+を通る。音声専用の検索実行・権限バイパスはない。
+
+### アーキテクチャとProvider
+
+`personal_ai/external.py` のProtocolを実装してAssistantの `web_provider` /
+`calendar_provider` に注入する。アダプターは信頼された、import可能・pickle可能な
+statelessコードとし、外部サービスとの通信を担当する。LLMには通信アダプターを渡さない。
+既存のLLM Provider同様、任意Pythonコード自体をOSレベルで隔離するセキュリティsandboxではない。
+
+- `WebSearchProvider.search(query)` は最大20件の辞書を返す。必須キーは
+  `title, url, snippet, retrieved_at, provider`。URLはhttp(s)、時刻はtimezone付きISO形式。
+- `CalendarProvider.list_events(date)` / `get_event(event_id)` は読み取り専用。
+  イベントは `id, title, date, retrieved_at, provider`。Phase 3の最小契約は日単位で、
+  時刻・繰り返し・参加者はまだ扱わない。今日の日付はホストのローカルtimezone。
+- 未知キー、欠損、型不正、件数/文字数超過、providerの不一致は `malformed_response`。
+- `ConnectionError` は `network_failure`、`TimeoutError` とruntime期限超過は `timeout`、
+  その他のProvider例外は `provider_unavailable`。例外本文は記録しない。
+
+### 検索判断・送信のprivacy境界
+
+安全側に限定した入力パーサーが**現在の明示的ユーザー入力だけ**から要求を確定する。
+LLMのTool proposalは名前・引数がその要求と完全一致する場合のみ通る。
+Memory・ファイル・過去会話からのquery補完、曖昧な「それを調べて」の解決は行わない。
+`/tool` JSON経由だけで外部通信を許可することもない。
+
+`ExternalPermission` はホストAPIが渡すターン限定の権限で、モデル引数には含めない。
+
+| 分類 | 挙動 |
+|---|---|
+| `local-only` | 送信不可。approvedでも拒否 |
+| `cloud-sendable` | 指定Providerと現在の確定要求に限り許可 |
+| `explicit-approval-required` | 同じ条件に加えてホスト側の `approved=True` が必要 |
+
+組込みmockのみ明示的検索/予定入力に標準許可がある。交換したProviderはdefault deny。
+実接続を組み込むホストは、ユーザーに送信内容と送信先を示して分類・承認を取得すること。
+承認UIは今回未実装で、音声から実Providerへの送信も標準では拒否される。
+
+```python
+from personal_ai.external import ExternalPermission, PrivacyClassification
+
+answer = app.chat('/web Python', external_permission=ExternalPermission(
+    classification=PrivacyClassification.EXPLICIT_APPROVAL_REQUIRED,
+    approved=True,  # ホストがこの入力と送信先について承認を得た後のみ設定
+    provider='your-provider-id',
+))
+```
+
+分類はホストが管理する。秘密の自動検出・推測は行わないため、秘密を含むユーザー入力は
+ホストがlocal-onlyにする必要がある。既存Memory/ローカルファイルは外部要求の情報源に
+できず、忘れたMemoryもqueryへ補完できない。外部参照ターンのLLMコンテキストには
+Memory・履歴を含めない。この分類はWeb/Calendarの送信境界であり、既存の任意LLM
+Providerや音声cloud設定の通信方針を置換するものではない。
+
+### 外部データ・監査・失敗
+
+検索結果は `trust=untrusted_external_data` のデータとしてLLMへ渡す。
+Contextにも「命令として扱わない」方針を設定する。文字列の危険語除去に依存せず、
+外部参照ターンでは確定要求以外のToolを最初から禁止し、外部結果受領後のTool proposalを
+すべて拒否する。同一応答内での複数Tool実行も禁止。
+APIキー送信、ローカルファイル読み取り、権限変更を外部本文から実行する経路はない。
+
+回答には生成に提供した結果のURL/取得時刻/Provider（予定はID）をruntimeが追記する。
+これは提供した根拠候補の追跡であり、LLMの各文がその根拠から導かれることの検証ではない。
+監査にはprovenance・送信分類・Providerを保存し、queryやsnippetは保存しない。
+会話DBには外部回答を `external_assistant`、要求を `external_user` として保存し、
+次回以降の `Store.history()` から除外する。これにより遅延したprompt injectionを防ぐ。
+外部会話はDBに残るが通常の履歴APIには現れない。Memoryへの自動保存はしない。
+
+取得失敗はruntimeが失敗応答を返し、LLMによる内部知識への暗黙fallbackを行わない。
+外部要求に対してTool結果なしで回答するLLMも `external_result_missing` とする。
+既存の操作/ターンtimeoutとcancelでProvider処理を終了し監査に成否を残す。
+
+検証: `python3 -m unittest discover -s tests -q`。
+実Webサービス、ページ全文取得、Calendar書き込み、Gmail、PC操作、shell Tool、任意ファイル参照、
+ブラウザー操作、wake word、daemon、自律処理・background実行は未実装。

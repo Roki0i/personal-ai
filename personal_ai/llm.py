@@ -1,4 +1,5 @@
 import json
+from .external import request_from_message
 from .models import Context, Reply, ToolCall
 
 
@@ -15,6 +16,9 @@ class MockLLM:
             if not last.ok:
                 return Reply("操作に失敗しました。")
             return Reply("操作が完了しました。\n" + json.dumps(last.data, ensure_ascii=False))
+        request = request_from_message(context.message)
+        if request:
+            return Reply(calls=[request])
         if context.message.startswith("/tool "):
             try:
                 value = json.loads(context.message[6:])

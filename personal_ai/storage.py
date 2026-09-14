@@ -49,7 +49,7 @@ class Store:
 
     def history(self, limit=12):
         rows = self.db.execute(
-            "SELECT role,content FROM conversations WHERE epoch=? ORDER BY id DESC LIMIT ?",
+            "SELECT role,content FROM conversations WHERE epoch=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?",
             (self.epoch(), limit),
         ).fetchall()
         return [dict(row) for row in reversed(rows)]
@@ -94,6 +94,11 @@ class Store:
                 (name, "started", json.dumps(metadata or {}, ensure_ascii=False), now()),
             )
             return cursor.lastrowid
+
+    def operation_metadata(self, operation_id, metadata):
+        with self.db:
+            self.db.execute("UPDATE operations SET metadata=? WHERE id=?",
+                            (json.dumps(metadata, ensure_ascii=False), operation_id))
 
     def finish_operation(self, operation_id, status, error=None):
         with self.db:

@@ -16,6 +16,9 @@ HELP = """通常の入力: mock LLMと会話（外部通信なし）
 /search 検索語               許可フォルダのメモ検索
 /read 相対パス               UTF-8の .md/.txt を読み取り
 /note 相対パス 内容          新規メモ作成（上書き禁止）
+/web 検索語                 Web検索（標準はoffline mock）
+/calendar                    今日の予定（読み取りのみ）
+/event ID                    予定詳細（mock ID: demo）
 /tool JSON                   mockのLLM→ツール実行ループを試す
 /logs                        最近の操作ログ（本文は含まない）
 /voice                       Push-to-Talk（--voice mock|local 指定時）
@@ -38,7 +41,7 @@ def handle(app, line):
         line = "/memory forget " + line[len("忘れて "):]
     if line.strip() == "忘れて":
         return "削除対象を指定してください: 忘れて ID または 忘れて all"
-    if not line.startswith("/") or line.startswith("/tool "):
+    if not line.startswith("/") or line.startswith(("/tool ", "/web ", "/event ")) or line == "/calendar":
         return app.chat(line)
     parts = shlex.split(line)
     command = parts[0]
