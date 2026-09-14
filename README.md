@@ -6,7 +6,8 @@ Phase 1は、Python・CLI・SQLiteによるローカルの基盤です。
 現在のLLMは**外部通信しないmock**です。APIキーも外部パッケージも不要で、
 会話履歴・記憶・権限判定・ファイル操作・失敗処理を試せます。
 mockは固定ルールによる動作確認用であり、自然言語を理解する実際のLLMではありません。
-音声・Web検索・PC操作・常駐処理・クラウドAPI接続は実装していません。
+Phase 2のPush-to-Talk音声入力・応答を追加しています（既定は無効）。
+Web検索・PC操作・常駐処理・クラウドAPI接続は実装していません。
 
 ## 起動
 
@@ -93,9 +94,12 @@ personal_ai/
   storage.py    SQLiteの履歴・Memory・操作ログ
   tools.py      ツール登録、引数スキーマ、許可判定
   files.py      許可フォルダ内のファイル操作
-  runtime.py    別プロセス実行、タイムアウト、停止
+  runtime.py    別プロセス実行、タイムアウト、停止、共有キャンセルスコープ
+  voice.py      音声Protocol、権限、状態管理、PTT制御、mock
+  voice_local.py Vosk / Piper / sounddeviceの任意ローカル実装
 tests/
   test_mvp.py   セキュリティ、失敗処理、CLIの統合テスト
+  test_voice.py 音声パイプライン、失敗、停止、privacy、ローカル接続テスト
 persona.json    任意に読み込む人格設定
 pyproject.toml  パッケージ情報とCLIエントリポイント
 ```
@@ -189,3 +193,148 @@ python3 -m unittest discover -s tests -v
 - LLMタイムアウト、異常応答、例外、ツール回数制限、操作ログ。
 - タイムアウトした子プロセスが停止し、後から書き込みを行わないこと。
 - APIキーを除いた環境で、実際のCLIとmockのツールループが動くこと。
+
+
+## Phase 2：Push-to-Talk音声インターフェース
+
+### 外部サービスなしで動かす
+
+```sh
+python3 -m personal_ai --persona persona.json --voice mock
+```
+
+`/voice` を入力し、次のプロンプトでEnterを押すと1回だけ処理します。
+mockはマイクもスピーカーも使わず、メモリ内のダミーPCM → 固定STT →
+既存Assistant → ダミーTTS → 模擬再生を実行します。
+文字の応答を表示した後、通常の `you>` に戻ります。
+認識結果を変えるには `--mock-transcript 'こんにちは'` を指定してください。
+`--mock-transcript '/read missing.md'` で操作失敗の読み上げ経路も試せます。
+
+### アーキテクチャ・交換点
+
+```text
+/voice → Enterで録音開始 → Enterで録音停止（最大30秒）
+       → Recorder.record → SpeechToTextProvider.transcribe
+       → 既存 cli.handle → Assistant / Memory / Tools
+       → テキスト表示 → TextToSpeechProvider.synthesize → Player.play
+```
+
+`voice.py` のProtocolを実装し、`VoiceSession(assistant, stt, tts, recorder, player)`
+に注入できます。STTとTTSは互いに独立して交換可能です。
+
+| interface | 入出力 | 標準の選択肢 |
+| --- | --- | --- |
+| `SpeechToTextProvider` | `transcribe(Audio) -> str` | `MockSTT`、`VoskSTT` |
+| `TextToSpeechProvider` | `synthesize(str) -> Audio` | `MockTTS`、`PiperTTS` |
+| `Recorder` | `record(stop_event, max_seconds) -> Audio` | `MockRecorder`、`SoundDeviceRecorder` |
+| `Player` | `play(Audio) -> None` | `MockPlayer`、`SoundDevicePlayer` |
+
+`Audio`はモノラル・16-bit little-endian PCM、サンプルレート、送信分類を持ちます。
+STT・TTSには設定側の固定`provider_id`と`location`（`local` / `cloud`）が必要です。
+providerはimport可能・pickle可能な、信頼されたステートレスPythonコードにします。
+モデルや音声のダウンロードは起動時にも認識時にも行いません。
+
+音声入力も `cli.handle` を通るため、明示Memoryコマンド、Persona、Memoryのepoch、
+Tool権限、ファイル安全性、監査ログ、既存の操作・会話タイムアウトが同じです。
+`/memory add ...` と認識された明示コマンドはテキスト入力と同じくMemoryを変更します。
+音声の誤認識を確認する画面は未実装なので、重要な明示コマンドはテキストで確認できます。
+Tool失敗時はPhase 1が生成した失敗の応答をそのままTTSへ渡し、LLMで成功に言い換えません。
+
+### 状態と停止・失敗
+
+`idle → recording → transcribing → reasoning → speaking → idle` が通常の遷移です。
+`speaking` は音声合成と再生の両方を含みます。
+録音・認識・合成・再生の失敗は`failed`、キャンセルは`cancelled`になります。
+どちらの状態からも次の `/voice` で再試行できます。
+`idle`への復帰は音声パイプラインの完了を意味し、Toolの成功を意味しません。
+LLM/Toolの失敗は既存経路のテキスト応答として表示・読み上げます。
+
+- ローカル録音中のEnter：録音を終了し、STTへ進みます。
+- Ctrl+C：録音・STT・LLM・Tool・TTS・再生の現在の処理をキャンセルします。
+- APIの `cancel()` / `stop_recording()` は別スレッドから呼べます。
+  `run()` 自体はSQLiteを所有するメインスレッドで実行してください。
+- ブロッキング処理は子プロセスで実行し、キャンセル・タイムアウト時は停止して回収します。
+- STT失敗時は会話を開始せず、通常のテキスト入力へ戻れます。
+- 応答は合成前に表示します。TTS・再生失敗でも `VoiceResult.text` と既存の会話履歴に残ります。
+  Memory等のCLIコマンド応答はPhase 1と同じ保存規則で、戻り値と画面には残ります。
+- 既定の音声操作制限は15秒、全体は90秒（録音含む）。録音段階の制限は30秒＋起動猶予15秒です。
+  `--voice-timeout` / `--voice-turn-timeout` で変更できます。
+  既存の `--timeout` / `--turn-timeout` も同時に効き、より早い期限で停止します。
+- MemoryのSQLite更新は短い原子的処理です。完了済みのMemory更新やファイル書き込みを
+  キャンセルで巻き戻すことはありません。
+
+### Privacyとcloud境界
+
+raw録音と合成PCMはRAMと子プロセス間通信のみで扱い、音声ファイル・DB・監査ログには保存しません。
+保存を有効にするオプションも追加していません。処理終了時にアプリ側の参照を解放します。
+OSのswapやクラッシュダンプを含む安全なメモリ消去を保証するものではありません。
+
+**認識テキストと回答は、Phase 1と同じ会話履歴としてローカルSQLiteに保存されます。**
+音声や会話からMemoryを自動抽出・登録することはありません。
+`voice_record` / `voice_stt` / `voice_tts` / `voice_play` の監査には開始・成否・固定エラーコードだけを保存し、
+PCM・認識本文・回答本文・provider例外詳細は記録しません。
+既存LLM/Tool/Memoryの監査ログもそのまま残ります。
+
+`VoicePermission`は各`run()`に渡す明示的な設定です。既定は全データ`local-only`、cloud許可なしです。
+
+| 段階 | cloud呼出しに必要な条件（両方必要） |
+| --- | --- |
+| STT | `input_policy=CLOUD_SENDABLE` ＋ 対象`provider_id`が`cloud_stt`に存在 |
+| TTS | `response_policy=CLOUD_SENDABLE` ＋ 対象`provider_id`が`cloud_tts`に存在 |
+
+`cloud-sendable`分類だけでは送信許可になりません。許可だけでも`local-only`を送信できません。
+STT許可はTTSに引き継がず、次のターンにも記憶しません。
+回答にはMemoryやローカルファイルの内容が含まれ得るため、入力とは独立して既定`local-only`にします。
+将来cloud TTSを接続するUIは、**回答全体の内容を送信する許可**を明示的に得た上で、この両条件を設定する必要があります。
+認識テキストやLLM出力から権限を付与する経路はありません。
+不明な`location`や権限不足はproviderを呼ぶ前に拒否し、`denied`を監査します。
+
+cloud providerやcloud設定用CLIは今回追加していません。
+この境界は信頼されたアダプターに対するアプリ制御であり、悪意あるPythonコードの通信を
+OSレベルで隔離するものではありません。ローカルと宣言するproviderは通信・独自保存を行わない必要があります。
+
+### 実マイク・ローカルモデルで動かす
+
+実機用の任意依存を別の仮想環境に導入します（導入時のパッケージ取得にはネットワークが必要です）。
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e '.[voice]'
+```
+
+Voskモデルの展開済みディレクトリと、Piper音声の`.onnx`および同名の`.onnx.json`を
+事前に用意してください。モデルは信頼できる配布元から、使用言語と利用条件に合うものを選びます。
+本体から自動取得はしません。sounddeviceには利用可能なPortAudioと入力・出力デバイスが必要です。
+macOSでは利用するターミナルにマイク権限を与えてください。
+
+```sh
+python3 -m personal_ai --persona persona.json --voice local \
+  --stt-model /absolute/path/to/vosk-model \
+  --tts-model /absolute/path/to/voice.onnx \
+  --voice-timeout 30 --voice-turn-timeout 120
+```
+
+1. `/voice`を入力し、Enterで録音開始。
+2. 話し終えたらEnterで停止（最大30秒で自動停止）。
+3. 認識・既存Assistantの処理後、画面に回答を表示し、音声再生。
+4. 任意の段階でCtrl+Cで取消。通常の文字入力も引き続き使用可能。
+
+モデル・依存パッケージ・デバイスがない場合は音声処理が失敗し、文字入力へ戻ります。
+アダプターは[Voskの公式録音例](https://github.com/alphacep/vosk-api/blob/master/python/example/test_microphone.py)と
+[PiperのPython API](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/API_PYTHON.md)に沿っています。
+
+### 検証範囲と制約
+
+`python3 -m unittest discover -s tests -v` でPhase 1・Phase 2をまとめて検証できます。
+テストは外部サービス・追加パッケージ不要です。
+mock一連処理、全ブロッキング段階の停止とタイムアウト、STT/TTS/再生失敗、
+忘却後の再起動、Tool失敗、raw音声の非保存、STT/TTSごとのcloud拒否・許可を検証します。
+ローカルアダプターのAPI接続は偽の依存モジュールでテストします。
+
+実マイク、実モデルの認識精度・発音・遅延はこの環境では未検証です。
+日本語STTには日本語モデル、TTSには回答言語に対応する音声モデルが必要で、
+Piperの利用可能な音声と言語に制約があります。英語音声で日本語の読み上げ品質は保証できません。
+LLMは引き続きPhase 1のmockです。自然な音声対話には本物のLLM実装が別途必要です。
+モデルは各操作で読み込むため起動遅延があり、ストリーミング応答、割込み会話、複数同時セッションは未対応です。
+常時マイク・wake word・Web検索・Calendar・PC/shell操作・daemon・自律タスクは追加していません。

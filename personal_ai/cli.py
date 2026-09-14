@@ -18,6 +18,7 @@ HELP = """通常の入力: mock LLMと会話（外部通信なし）
 /note 相対パス 内容          新規メモ作成（上書き禁止）
 /tool JSON                   mockのLLM→ツール実行ループを試す
 /logs                        最近の操作ログ（本文は含まない）
+/voice                       Push-to-Talk（--voice mock|local 指定時）
 /help                        このヘルプ
 /quit                        終了
 空白を含むパスは引用符で囲んでください。"""
@@ -77,12 +78,26 @@ def main(argv=None):
     parser.add_argument("--persona", help="JSON persona file (name, instructions)")
     parser.add_argument("--timeout", type=float, default=10.0, help="per-operation seconds")
     parser.add_argument("--turn-timeout", type=float, default=30.0)
+    parser.add_argument("--voice", choices=("mock", "local"))
+    parser.add_argument("--stt-model", help="existing local Vosk model directory")
+    parser.add_argument("--tts-model", help="existing local Piper .onnx file")
+    parser.add_argument("--mock-transcript", default="こんにちは")
+    parser.add_argument("--voice-timeout", type=float, default=15)
+    parser.add_argument("--voice-turn-timeout", type=float, default=90)
     args = parser.parse_args(argv)
+    if args.voice == "local" and (not args.stt_model or not args.tts_model):
+        parser.error("--voice local requires --stt-model and --tts-model")
     try:
         app = Assistant(args.data_dir, args.notes_dir, args.persona,
                         timeout=args.timeout, turn_timeout=args.turn_timeout)
     except (OSError, ValueError, sqlite3.Error):
         print("起動できませんでした。設定ファイル・保存先・権限を確認してください。")
+        return 1
+    try:
+        voice = make_voice(app, args) if args.voice else None
+    except ValueError:
+        app.close()
+        print("音声設定の時間制限が不正です。")
         return 1
     print("{} / mockモード・外部通信なし。/help でコマンド一覧。".format(app.persona.name))
     try:
@@ -91,7 +106,12 @@ def main(argv=None):
                 line = input("you> ").strip()
                 if line == "/quit":
                     break
-                if line:
+                if line == "/voice":
+                    if voice is None:
+                        print("--voice mock または --voice local で起動してください。")
+                    else:
+                        run_voice_cli(voice, args.voice)
+                elif line:
                     print(handle(app, line))
             except EOFError:
                 break
@@ -104,3 +124,34 @@ def main(argv=None):
     finally:
         app.close()
     return 0
+
+
+def make_voice(app, args):
+    from .voice import VoiceSession, MockSTT, MockTTS, MockRecorder, MockPlayer
+    if args.voice == "mock":
+        adapters = (MockSTT(args.mock_transcript), MockTTS(), MockRecorder(), MockPlayer())
+    else:
+        from .voice_local import VoskSTT, PiperTTS, SoundDeviceRecorder, SoundDevicePlayer
+        adapters = (VoskSTT(args.stt_model), PiperTTS(args.tts_model),
+                    SoundDeviceRecorder(), SoundDevicePlayer())
+    return VoiceSession(app, *adapters, timeout=args.voice_timeout,
+                        turn_timeout=args.voice_turn_timeout)
+
+
+def run_voice_cli(voice, mode):
+    import select
+    import sys
+    from .voice import VoiceState
+    input("Enterで録音開始（Ctrl+Cで取消）> ")
+    print("録音中: Enterで停止、最大30秒。Ctrl+Cは全工程で取消。" if mode == "local"
+          else "mock音声を処理します（マイク・スピーカーは使用しません）。")
+
+    def poll():
+        if mode == "local" and voice.state == VoiceState.RECORDING:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                sys.stdin.readline()
+                voice.stop_recording()
+
+    result = voice.run(on_text=print, poll=poll)
+    if result.error:
+        print("音声処理: {}。テキスト入力を続けられます。".format(result.error))

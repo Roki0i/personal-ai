@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .llm import MockLLM, generate
 from .models import Context, Persona, Reply, ToolCall
-from .runtime import OperationError, run_bounded
+from .runtime import OperationError, cancel_current, run_bounded
 from .storage import Store
 from .tools import SCHEMAS, Tools
 
@@ -132,6 +132,7 @@ class Assistant:
             if any(item.ok for item in context.results):
                 answer += " 一部の操作は完了済みです。/logs で確認できます。"
         except KeyboardInterrupt:
+            cancel_current()
             if operation is not None:
                 self.store.finish_operation(operation, "cancelled", "cancelled")
             answer = "処理をキャンセルしました。実行済みの操作は /logs で確認してください。"

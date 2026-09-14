@@ -1,6 +1,51 @@
 """Run blocking provider/tool work with a cancellable process boundary."""
 import multiprocessing
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import Event
 from typing import Callable
+
+
+_scope = ContextVar("execution_scope", default=None)
+
+
+class CancellationToken:
+    def __init__(self):
+        self._event = Event()
+
+    def cancel(self):
+        self._event.set()
+
+    def is_cancelled(self):
+        return self._event.is_set()
+
+
+@contextmanager
+def execution_scope(token, deadline, poll=None):
+    marker = _scope.set((token, deadline, poll))
+    try:
+        yield
+    finally:
+        _scope.reset(marker)
+
+
+def cancel_current():
+    scope = _scope.get()
+    if scope:
+        scope[0].cancel()
+
+
+def check_pending():
+    scope = _scope.get()
+    if scope:
+        token, deadline, poll = scope
+        if poll:
+            poll()
+        if token.is_cancelled():
+            raise KeyboardInterrupt
+        if time.monotonic() >= deadline:
+            raise OperationError("timeout")
 
 
 class OperationError(Exception):
@@ -18,6 +63,10 @@ def _worker(connection, function, args):
 
 
 def run_bounded(function: Callable, args: tuple, timeout: float):
+    check_pending()
+    scope = _scope.get()
+    if scope:
+        timeout = min(timeout, scope[1] - time.monotonic())
     if timeout <= 0:
         raise OperationError("timeout")
     ctx = multiprocessing.get_context("spawn")
@@ -29,8 +78,15 @@ def run_bounded(function: Callable, args: tuple, timeout: float):
         process.start()
         started = True
         sender.close()
-        if not receiver.poll(timeout):
-            raise OperationError("timeout")
+        deadline = time.monotonic() + timeout
+        while True:
+            check_pending()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OperationError("timeout")
+            if receiver.poll(min(0.05, remaining)):
+                break
+        check_pending()
         try:
             ok, value = receiver.recv()
         except EOFError:
@@ -38,6 +94,10 @@ def run_bounded(function: Callable, args: tuple, timeout: float):
         if not ok:
             raise OperationError(value)
         return value
+    except KeyboardInterrupt:
+        if scope:
+            scope[0].cancel()
+        raise
     except (OSError, ValueError, TypeError) as exc:
         raise OperationError("worker_unavailable") from exc
     finally:
