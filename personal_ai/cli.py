@@ -5,6 +5,7 @@ import sqlite3
 
 from .app import Assistant
 from .models import ToolCall
+from .tasks import route as route_task
 
 
 HELP = """通常の入力: mock LLMと会話（外部通信なし）
@@ -25,6 +26,14 @@ HELP = """通常の入力: mock LLMと会話（外部通信なし）
 /calendar                    今日の予定（読み取りのみ）
 /event ID                    予定詳細（mock ID: demo）
 /tool JSON                   mockのLLM→ツール実行ループを試す
+/task propose JSON配列       ローカルTaskを提案（変更は承認待ち）
+/task list                   Task一覧（永続情報は本文なし）
+/task show ID                Taskの計画・状態・検証結果
+/task approve ID             表示された計画を承認して実行
+/task deny ID                実行を拒否
+/task cancel ID              未実行Taskを取消
+/tools                       ローカルToolとrisk一覧
+/permissions                 ローカルTaskの権限規則
 /logs                        最近の操作ログ（本文は含まない）
 /voice                       Push-to-Talk（--voice mock|local 指定時）
 /help                        このヘルプ
@@ -42,6 +51,9 @@ def render_tool(result):
 
 
 def handle(app, line):
+    local_answer = route_task(app.tasks, line)
+    if local_answer is not None:
+        return local_answer
     if line.startswith("覚えて "):
         line = "/memory add " + line[len("覚えて "):]
     if line.startswith("忘れて "):
@@ -108,6 +120,9 @@ def main(argv=None):
     parser.add_argument("--persona", help="JSON persona file (name, instructions)")
     parser.add_argument("--timeout", type=float, default=10.0, help="per-operation seconds")
     parser.add_argument("--turn-timeout", type=float, default=30.0)
+    parser.add_argument("--local-provider", choices=("mock", "macos"), default="mock")
+    parser.add_argument("--allowed-repository", action="append", default=[],
+                        help="read-only Git repository relative to --notes-dir; repeatable")
     parser.add_argument("--voice", choices=("mock", "local"))
     parser.add_argument("--stt-model", help="existing local Vosk model directory")
     parser.add_argument("--tts-model", help="existing local Piper .onnx file")
@@ -119,7 +134,8 @@ def main(argv=None):
         parser.error("--voice local requires --stt-model and --tts-model")
     try:
         app = Assistant(args.data_dir, args.notes_dir, args.persona,
-                        timeout=args.timeout, turn_timeout=args.turn_timeout)
+                        timeout=args.timeout, turn_timeout=args.turn_timeout,
+                        local_mode=args.local_provider, allowed_repositories=args.allowed_repository)
     except (OSError, ValueError, sqlite3.Error):
         print("起動できませんでした。設定ファイル・保存先・権限を確認してください。")
         return 1
@@ -129,7 +145,7 @@ def main(argv=None):
         app.close()
         print("音声設定の時間制限が不正です。")
         return 1
-    print("{} / mockモード・外部通信なし。/help でコマンド一覧。".format(app.persona.name))
+    print("{} / LLMはmock・外部通信なし。/help でコマンド一覧。".format(app.persona.name))
     try:
         while True:
             try:

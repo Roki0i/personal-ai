@@ -1,5 +1,7 @@
 """Run blocking provider/tool work with a cancellable process boundary."""
 import multiprocessing
+import os
+import signal
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -52,7 +54,9 @@ class OperationError(Exception):
     pass
 
 
-def _worker(connection, function, args):
+def _worker(connection, function, args, process_group=False):
+    if process_group:
+        os.setsid()
     try:
         connection.send((True, function(*args)))
     except Exception:
@@ -62,7 +66,7 @@ def _worker(connection, function, args):
         connection.close()
 
 
-def run_bounded(function: Callable, args: tuple, timeout: float):
+def run_bounded(function: Callable, args: tuple, timeout: float, *, process_group=False):
     check_pending()
     scope = _scope.get()
     if scope:
@@ -71,7 +75,7 @@ def run_bounded(function: Callable, args: tuple, timeout: float):
         raise OperationError("timeout")
     ctx = multiprocessing.get_context("spawn")
     receiver, sender = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=_worker, args=(sender, function, args))
+    process = ctx.Process(target=_worker, args=(sender, function, args, process_group))
     process.daemon = True
     started = False
     try:
@@ -104,6 +108,12 @@ def run_bounded(function: Callable, args: tuple, timeout: float):
         sender.close()
         receiver.close()
         if started:
+            if process_group:
+                # Include any fixed-argv local subprocess on cancellation/timeout.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if process.is_alive():
                 process.terminate()
             process.join(0.5)

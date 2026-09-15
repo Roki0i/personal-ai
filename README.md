@@ -624,3 +624,225 @@ Phase 4の104テストに23件を追加。旧仕様を検証していた1件は�
 再起動、voice、Web/Calendar境界、世代競合、トランザクションrollback、privacy、DB移行を検証する。
 
 Phase 5のPC操作、shell Tool、daemon、自律実行は追加していない。
+
+## Phase 5: Safe local task execution / PC操作・タスク委譲
+
+### Task architecture
+
+Phase 5のPC操作は **現在の明示的なユーザー入力**からのみ開始する。
+`User request → Task proposal → Risk classification → Permission → Execution → Verification → Result`
+を `TaskManager` が管理する。LLMにPC操作Toolのschemaを渡さず、LLMの出力・履歴・Memory・
+Web/Calendar結果・読んだfile本文からTaskを生成しない。
+
+`Task` は `task_id`, `requested_at`, `intent`, `proposed_actions`, `risk_level`,
+`permission_state`, `started_at`, `finished_at`, `status`, `result`, `error`,
+`audit_reference`, `allowed_root` を持つ。計画はdeep copyし、承認後は最大8stepを順に実行。
+呼出元が返却された計画を変更しても実行対象は変わらない。Provider・許可フォルダ・repository設定が
+提案後に変わった場合も承認を拒否する。Taskの承認は一回限りで、再実行・再起動後の引継ぎはない。
+
+| 状態 | 意味 |
+| --- | --- |
+| proposed | 計画表示済み、承認待ち |
+| running | 承認済み、実行中 |
+| completed | 全stepの実行後検証が成功 |
+| unverified | 実行要求は処理されたが、OS状態などを確認できないstepがある |
+| failed | 完了を確認できた先行stepなし。errorが副作用不明を示す場合は対象の確認が必要 |
+| partial | 先行stepまたは検証前の実行結果あり。後続stepは停止 |
+| denied / cancelled | 未実行の計画を拒否 / 取消 |
+| expired / interrupted | 別セッションの未実行計画 / 終了を記録できなかった実行。自動再開しない |
+
+`--timeout` が各実行・検証、`--turn-timeout` がTask全体の上限。
+Ctrl+C・音声取消・timeoutではworkerとそのsubprocess groupを停止する。
+実行workerのtimeout・応答喪失は `*_effects_unknown` として表示する。
+書込み済みの可能性があるため、自動再実行せず対象を確認する。各stepの開始前にもTask全体の期限を検査する。
+`/task cancel ID` は承認待ちTask用。同期実行中の取消にはCtrl+Cを使用する。
+
+### Risk / Permission
+
+| Risk | 操作 | Policy |
+| --- | --- | --- |
+| LOW | list/read、対応app一覧、system info、許可されたread-only command、listのfilter | 明示依頼した計画だけに権限を付与 |
+| MEDIUM | create file/directory、rename/copy/move、file/app open、Finder reveal | 計画・対象root・引数を表示し、`/task approve ID` 後だけ実行 |
+| HIGH | delete、overwrite、process termination、shell、external upload、未知の操作 | 今回はすべて無効。承認しても実行可能にしない |
+
+HIGH操作の実装を追加していないため、HIGHを確認なしで実行する経路はない。
+未知のcommand・追加引数・`overwrite: true`・任意app名を拒否する。
+Providerでもschema、固定risk、操作名と全引数のdigestに結び付いたホスト発行の権限を再検査する。
+文字列の `permission=granted`、別Taskの操作用権限、riskをLOWに変えた権限は通らない。
+
+従来の `/note` と明示的な `/tool create_note` はPhase 1の単発メモ作成契約を維持する。
+Phase 5の汎用ファイル作成は `/task` 経由で承認が必要。LLMが独自にメモ書込みを提案する経路は拒否し、
+`read_note` の本文を受け取った後のTool連鎖も拒否する。`search_notes` の既存read-onlyループ上限は維持。
+
+### Local Tool / macOS Provider
+
+`LocalProvider` は `execute` / `verify` と設定情報を持つ、ホストが選ぶ信頼済みadapter。
+`FileLocalProvider` が既存 `Workspace` を拡張したPOSIXファイル処理を共有し、
+`MockLocalProvider` と `MacOSLocalProvider` がOS依存処理を別々に実装する。
+新しいOSではProviderを追加する。現時点の共通ファイル層・process group制御はPOSIX用で、Windows対応済みではない。
+
+| Tool | 現在の範囲 |
+| --- | --- |
+| list_directory | 指定した1階層、最大1,000entry。symlinkはblockedとして表示 |
+| read_file | 最大64 KiBのUTF-8通常file。拡張子は限定しない |
+| create_file / create_directory | 新規作成のみ、親directoryは既存であること |
+| copy / move / rename | 最大64 KiBのUTF-8通常file。directoryの移動・再帰copyは対象外 |
+| open_file | 許可フォルダ内の.md/.txtを既定appで開く |
+| reveal_in_finder | 同じ.md/.txtをFinderで表示 |
+| open_application | 固定allowlistのTextEdit / Calculatorを開く |
+| list_applications | 上記の対応allowlistを表示。全インストール済みappの走査はしない |
+| get_system_info | OS・release・architecture。mockでは固定値 |
+| command | 下記の構造化された固定commandのみ |
+| filter_files | 直前のdirectory listingを拡張子で絞り込む純粋処理 |
+
+既定は `--local-provider mock`。mockも許可フォルダ内のファイルは実際に読み書きするが、
+app起動・command・system infoはシミュレーションであり、GUIや外部サービスは使わない。
+テストでは一時フォルダを使用する。
+`--local-provider macos` で `/usr/bin/open` の引数配列によるfile/app起動・Finder表示を有効にする。
+GUIクリック、キーボード操作、screen readingはない。
+
+### File safety
+
+- `--notes-dir` をPhase 1と同じ許可フォルダとして使用する。data directoryとの重なりも従来どおり拒否。
+- file指定はrootからの相対pathのみ。directory listing / commandのroot指定は `.`。
+  絶対path、`..`、余分な `.`、空component、NUL、backslashを拒否する。
+- rootのdevice/inodeを検査し、各親directoryとfileをdescriptor-relativeに `O_NOFOLLOW` で開く。
+  隠しdirectoryにも同じ検査を行い、copy/moveのsourceとdestination両方へ適用する。
+- hardlink、FIFOなどの特殊fileを読まない。symlinkを辿らず、outsideへの書込みを行わない。
+- create/copyはexclusive create。move/renameは同一filesystem上でexclusive hardlinkを作成し、
+  inodeを検査してsourceをunlinkする。既存destinationを置換しない。
+- 上書きは承認後も実装していない。既存fileの場合は `already_exists_no_overwrite`。
+  delete / Trash / recursive deleteも未実装。
+- file操作の競合・中断は原子的な一括成功を保証しない。move途中に2つのlinkが残るなどの状態を
+  `partial` または副作用不明のerrorで扱い、後続処理と危険な自動rollbackを行わない。
+
+macOSのLaunchServices/Finderはpathを受け取るため、file openでは直前に再検査しても、
+**別のローカルプロセスによる検査直後の悪意あるpath差替えまで防ぐOS brokerは未実装**。
+通常のtraversal/symlink escapeは拒否するが、この競合まで含む無条件のsandbox保証はしない。
+既定appの動作や起動完了も保証しないため、起動結果は `verified=false` とする。
+
+### Shell safety / read-only Git
+
+`command` はshell文字列ではなく、次の固定識別子だけを受理する。
+
+- `pwd`
+- `git status` / `git diff` / `git log` / `git branch`
+- `python --version` / `node --version`
+
+`subprocess` は固定の絶対実行pathと引数配列。shell、eval、exec、sudo/su、任意bash/zsh、
+追加option、pipe、command substitution、chmod/chown、credential操作を渡す口はない。
+process起動直前にも引数配列のallowlistを検査する。stdoutとstderrの合計は64 KiB、processは5秒で制限。
+継承する環境を限定し、`NODE_OPTIONS`、`PYTHONPATH`、Gitのcommand設定などを引き継がない。
+Pythonは `/usr/bin/python3`、Nodeは `/opt/homebrew/bin/node` または `/usr/local/bin/node`。
+見つからなければ失敗し、自動installやPATH探索はしない。
+
+Gitは `--allowed-repository repo` のように明示設定したroot相対repository内だけ。
+元repositoryに対してGitを起動せず、descriptor経由で読み取ったprivateな一時snapshot上で実行する。
+元の `.git/config`・hooksを除外し、固定configを使用。symlink/hardlink、gitdir/commondir、
+alternates、submodule、入れ子repository、worktreeの間接参照を拒否する。
+`--no-optional-locks`、pager無効、fsmonitor/hooks無効、protocol無効、
+diffの `--no-ext-diff --no-textconv` を固定する。logは最新30件。
+commit/push/reset/clean/checkoutのcommandは存在しない。
+
+snapshotは1,000entry、深さ16、1file 4 MiB、合計16 MiBまで。
+大きなrepository、symlinkを含むrepository、sparse/SHA-256等の特殊repositoryは対応範囲外。
+元configを省くため、filter・local ignore等に依存する結果は通常のGit表示と異なり得る。
+同時更新下の一貫したtransaction snapshotではなく、結果には `snapshot=true`, `verified=false` を付ける。
+親プロセスが一時領域を所有し、workerのtimeout・取消後も削除する。
+アプリ全体の強制終了・OS障害後の残存一時領域の回収は今後の課題。
+
+### Task examples / CLI
+
+```console
+python3 -m personal_ai --notes-dir notes --local-provider mock
+```
+
+```text
+このフォルダのPythonファイル一覧を出して
+# list_directory → filter_files → result
+
+demoフォルダとREADMEを作って
+# 計画を表示。まだ作成しない
+/task approve <表示されたID>
+# create_directory → verify → create_file → verify
+
+/task propose [{"name":"copy","arguments":{"source":"hello.txt","destination":"copy.txt"}}]
+/task deny <表示されたID>
+/task list
+/task show <ID>
+/task cancel <未実行ID>
+/tools
+/permissions
+```
+
+macOSのDocumentsを対象にする場合は最初から許可フォルダを明示設定する。
+既定のnotesをDocumentsとして黙って扱うことはない。
+
+```console
+python3 -m personal_ai --notes-dir "$HOME/Documents" --local-provider macos --allowed-repository demo-repo
+```
+
+```text
+DocumentsにdemoフォルダとREADMEを作って
+/task approve <表示されたID>
+demo/README.mdを開いて
+/task approve <表示されたID>
+demo/README.mdをFinderで表示して
+/task approve <表示されたID>
+TextEditを開いて
+/task approve <表示されたID>
+demo-repoでgit statusを表示して
+```
+
+自然文は上記や `PATHを読んで`, `PATHのPythonファイル一覧を出して`,
+`システム情報を表示して`, `アプリ一覧を表示して` の厳密な文型のみ。
+任意の文章をLLMで実行計画に変換する機能ではない。その他の計画は `/task propose` で明示する。
+file本文に `/task approve ...` 等があっても再解釈しない。
+
+### Voice / Memory / Audit
+
+Voiceは既存の `handle()` を通るため、Textと同じ計画表示・ID付き承認・拒否・検証を使用する。
+音声の「はい」を包括承認と解釈せず、`/task approve ID` の正確なtranscriptが必要。
+STT/TTSの既存cloud permissionや取消・時間制限はそのまま適用する。
+
+Taskの依頼・計画・path・file本文・command output・system infoは会話テーブルへ追加せず、
+LLM context・Memory自動抽出・summaryへ渡さない。詳細は現在のセッションのRAM内だけ。
+終了時に参照を解放し、別セッションでは本文を復元せず再実行もできない。
+Python文字列の物理的なメモリ消去を保証するものではない。
+
+SQLiteの `local_tasks` は時刻・状態・risk・権限・固定操作名・stepごとの検証成否・監査IDだけを保持する。
+本文、path、command識別子/出力、content hash、system infoは記録しない。
+`intent` / 引数は `[not retained]`、resultは検証成否のみとして再表示する。
+既存DBにはtableを追加するだけで、Memory/forget/updateのtableや移行を変更しない。
+
+既存operationsへ `task_proposed`, `task_permission_requested`, `task_permission_granted/denied`,
+`task_tool_started/completed/failed`, `task_verification`, `task_rollback` を記録する。
+metadataはtask ID・固定Tool名・step番号・risk・検証booleanなどに限定し、Provider例外も安全なcodeに変換する。
+不正・無効操作の提案は `task_proposal_denied`。
+rollbackは `not_attempted_manual_review_required` を記録してresourceを残す。
+安全性を証明できる作成resourceの識別・競合制御がないため、自動rollbackや汎用undoは追加していない。
+
+### 検証とPhase 6前の課題
+
+標準テストはmockと一時フォルダだけで実行でき、macOS app・実Git・音声機器・外部接続は不要。
+macOS起動はprocessをmockして引数を検証する。別途macOSの一時repositoryで4種の実Gitを実行し、
+期待した表示と元repositoryのfile hashが変わらないことを確認した。実GUIの起動は行っていない。
+
+```console
+python3 -m unittest discover -s tests -q
+```
+
+既存127テストを維持し、Phase 5の65テストを追加（合計192件）。承認の対象固定、
+ファイル境界、構造化command、Git snapshot、複数stepの検証・失敗停止、
+取消・timeout、worker応答喪失、Memory/Auditへの本文非保存を検証する。
+
+Phase 6前に扱う課題:
+
+- macOS file openの競合も閉じるOS brokerと、実機でのLaunchServices/起動状態の検証。
+- Windows/Linuxのnative Providerと、それぞれの安全なfile・subprocess取消実装。
+- 大きいrepository、特殊Git構成、directory copy/moveへの安全な対応。
+- resource所有権と同時更新を検査できる限定rollback、強制終了後の一時領域回収。
+- 自然文の対応文型拡充。LLMを導入する場合も、現在の承認・出典境界をホスト側で維持すること。
+
+常駐化・自律実行・scheduled task・任意shell・GUI自動操作・browser操作・remote PC・
+Gmail送信・Calendar書込み・credential管理・自己改変は追加していない。

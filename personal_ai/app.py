@@ -13,12 +13,15 @@ from .models import Context, Persona, Reply, ToolCall
 from .runtime import OperationError, cancel_current, run_bounded
 from .storage import Store
 from .tools import SCHEMAS, Tools
+from .local import MockLocalProvider, MacOSLocalProvider
+from .tasks import TaskManager, route as route_task
 
 
 class Assistant:
     def __init__(self, data_dir, notes_dir, persona_path=None, provider=None,
                  timeout=10.0, turn_timeout=30.0, max_tool_calls=4,
-                 web_provider=None, calendar_provider=None):
+                 web_provider=None, calendar_provider=None, local_provider=None,
+                 local_mode="mock", allowed_repositories=()):
         if not all(math.isfinite(value) and value > 0 for value in (timeout, turn_timeout)):
             raise ValueError("timeout must be finite and positive")
         if not isinstance(max_tool_calls, int) or not 1 <= max_tool_calls <= 10:
@@ -44,6 +47,14 @@ class Assistant:
             self.tools = Tools(notes, self.store, timeout,
                                web_provider if web_provider is not None else MockWebSearchProvider(),
                                calendar_provider if calendar_provider is not None else MockCalendarProvider())
+            if local_mode not in ('mock', 'macos'):
+                raise ValueError('invalid_local_provider')
+            local = local_provider if local_provider is not None else (
+                MacOSLocalProvider if local_mode == 'macos' else MockLocalProvider)(
+                    notes, self.tools.identity, allowed_repositories)
+            if local.root != str(notes) or local.identity != self.tools.identity:
+                raise ValueError('local_provider_must_use_allowed_folder')
+            self.tasks = TaskManager(self.store, local, timeout, turn_timeout)
         except BaseException:
             self.store.close()
             raise
@@ -63,6 +74,7 @@ class Assistant:
         return Persona(**value)
 
     def close(self):
+        self.tasks.close()
         self.store.close()
 
     def memory(self, action, content=None, memory_id=None, **attributes):
@@ -98,6 +110,9 @@ class Assistant:
     def chat(self, message, *, external_permission=None):
         if not isinstance(message, str) or not message.strip() or len(message) > 16000:
             raise ValueError("message must contain 1 to 16000 characters")
+        local_answer = route_task(self.tasks, message)
+        if local_answer is not None:
+            return local_answer
         deadline = time.monotonic() + self.turn_timeout
         epoch = self.store.epoch()
         request = request_from_message(message)
@@ -149,6 +164,19 @@ class Assistant:
                     denied = self.store.start_operation("external_tool_boundary")
                     self.store.finish_operation(denied, "denied", "external_tool_chain_denied")
                     raise OperationError("external_tool_chain_denied")
+                if (any(result.name == 'read_note' for result in context.results)
+                        or (context.results and any(call.name == 'create_note' for call in reply.calls))):
+                    raise OperationError('untrusted_tool_chain_denied')
+                for call in reply.calls:
+                    if call.name == 'create_note':
+                        # Preserve the legacy explicit /tool create_note command;
+                        # model/history/file data cannot invent a write request.
+                        try:
+                            explicit = json.loads(message[6:]) if message.startswith('/tool ') else None
+                        except ValueError:
+                            explicit = None
+                        if explicit != {'name': call.name, 'arguments': call.arguments}:
+                            raise OperationError('explicit_write_request_required')
                 for call in reply.calls:
                     tool_count += 1
                     result = self.tools.execute(call, deadline - time.monotonic(),
