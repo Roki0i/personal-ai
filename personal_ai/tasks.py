@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .local import (FIELDS, HIGH, COMMANDS, APPLICATIONS,
-                    classify, validate, grant, MacOSLocalProvider)
+                    classify, validate, grant)
 from .files import FileDenied
 from .runtime import OperationError, check_pending, run_bounded
 from .storage import now
@@ -41,7 +41,7 @@ def action(name, **arguments):
 
 
 def execute_step(provider, step, permission, scratch):
-    if isinstance(provider, MacOSLocalProvider):
+    if getattr(provider, "provider_id", None) in ("macos-local", "windows-local"):
         provider.scratch_root = scratch
     try:
         return {'ok': True, 'data': provider.execute(step, permission), 'error': None}
@@ -193,7 +193,7 @@ class TaskManager:
                         with tempfile.TemporaryDirectory(prefix='personal-ai-task-') as scratch:
                             try:
                                 outcome = run_bounded(execute_step, (self.provider, step, grant(step), scratch),
-                                                   min(self.timeout, deadline - time.monotonic()), process_group=True)
+                                                   min(self.timeout, deadline - time.monotonic()), process_group=not provider_is_windows_dispatch(self.provider, step))
                             except OperationError as exc:
                                 # Dispatch may have changed files before the worker
                                 # lost its response or reached its time limit.
@@ -208,7 +208,7 @@ class TaskManager:
                         task.result.append({'step': index, 'data': data, 'verified': False})
                         try:
                             verified = run_bounded(verify_step, (self.provider, step, data),
-                                                   min(self.timeout, deadline - time.monotonic()), process_group=True)
+                                                   min(self.timeout, deadline - time.monotonic()), process_group=not provider_is_windows_dispatch(self.provider, step))
                         except BaseException:
                             self._audit(task, 'verification', index, verified=False)
                             raise
@@ -218,7 +218,7 @@ class TaskManager:
                     else:
                         task.result[-1]['verified'] = verified is True
                     self._audit(task, 'verification', index, verified=verified is True)
-                    verifiable = step['name'] not in ('open_file', 'open_application', 'reveal_in_finder', 'command')
+                    verifiable = step['name'] not in ('open_file', 'open_application', 'reveal_in_finder', 'reveal_in_explorer', 'command')
                     if verifiable and verified is not True:
                         raise OperationError('verification_failed')
                 except (Exception, KeyboardInterrupt):
@@ -273,11 +273,13 @@ def natural_request(message, root=None):
     if message == 'アプリ一覧を表示して': return [action('list_applications')]
     match = re.fullmatch(r'(.+)を読んで', message)
     if match: return [action('read_file', path=match[1])]
+    match = re.fullmatch(r'(.+)を(?:Explorer|エクスプローラー)で表示して', message)
+    if match: return [action('reveal_in_explorer', path=match[1])]
     match = re.fullmatch(r'(.+)をFinderで表示して', message)
     if match: return [action('reveal_in_finder', path=match[1])]
     match = re.fullmatch(r'(.+)を開いて', message)
     if match:
-        return [action('open_application', application=match[1])] if match[1] in APPLICATIONS else [action('open_file', path=match[1])]
+        return [action('open_application', application=match[1])] if match[1] in set(APPLICATIONS) | {'Notepad'} else [action('open_file', path=match[1])]
     match = re.fullmatch(r'(.+)で(git (?:status|diff|log|branch))を表示して', message)
     if match: return [action('command', path=match[1], command=match[2])]
     return None
@@ -306,3 +308,9 @@ def route(manager, line):
     actions = natural_request(line, manager.provider.root)
     if actions is not None: return render(manager.submit(line, actions))
     return None
+
+
+def provider_is_windows_dispatch(provider, step):
+    # GUI dispatch is intentionally persistent; bounded command trees use a Job.
+    return (getattr(provider, 'provider_id', None) == 'windows-local'
+            and step['name'] in ('open_file', 'open_application', 'reveal_in_finder', 'reveal_in_explorer'))

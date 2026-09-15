@@ -1,5 +1,5 @@
 from .external import EXTERNAL_NAMES, execute_external, outbound_allowed, provenance
-from .files import Workspace, execute_file
+from .files import workspace_for, execute_file
 from .models import ToolCall, ToolResult
 from .runtime import OperationError, run_bounded
 
@@ -47,7 +47,7 @@ class Tools:
     def __init__(self, root, store, timeout, web_provider=None, calendar_provider=None):
         self.web_provider, self.calendar_provider = web_provider, calendar_provider
         self.root, self.store, self.timeout = str(root), store, timeout
-        workspace = Workspace(root)
+        workspace = workspace_for(root)
         try:
             self.identity = workspace.identity
         finally:

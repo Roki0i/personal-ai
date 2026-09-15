@@ -120,7 +120,7 @@ def main(argv=None):
     parser.add_argument("--persona", help="JSON persona file (name, instructions)")
     parser.add_argument("--timeout", type=float, default=10.0, help="per-operation seconds")
     parser.add_argument("--turn-timeout", type=float, default=30.0)
-    parser.add_argument("--local-provider", choices=("mock", "macos"), default="mock")
+    parser.add_argument("--local-provider", choices=("auto", "mock", "macos", "windows"), default="auto")
     parser.add_argument("--allowed-repository", action="append", default=[],
                         help="read-only Git repository relative to --notes-dir; repeatable")
     parser.add_argument("--voice", choices=("mock", "local"))

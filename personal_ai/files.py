@@ -144,7 +144,7 @@ class Workspace:
 def execute_file(root, identity, name, arguments):
     workspace = None
     try:
-        workspace = Workspace(root, identity)
+        workspace = workspace_for(root, identity)
         if name == "search_notes":
             return True, workspace.search(arguments["query"]), None
         if name == "read_note":
@@ -165,3 +165,10 @@ def execute_file(root, identity, name, arguments):
     finally:
         if workspace is not None:
             workspace.close()
+
+
+def workspace_for(root, identity=None):
+    if os.name == 'nt':
+        from .windows import WindowsNotesWorkspace
+        return WindowsNotesWorkspace(root, identity)
+    return Workspace(root, identity)

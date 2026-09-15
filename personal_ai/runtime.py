@@ -54,8 +54,10 @@ class OperationError(Exception):
     pass
 
 
-def _worker(connection, function, args, process_group=False):
-    if process_group:
+def _worker(connection, function, args, process_group=False, ready=None):
+    if ready is not None:
+        ready.wait()
+    if process_group and os.name != 'nt':
         os.setsid()
     try:
         connection.send((True, function(*args)))
@@ -75,12 +77,18 @@ def run_bounded(function: Callable, args: tuple, timeout: float, *, process_grou
         raise OperationError("timeout")
     ctx = multiprocessing.get_context("spawn")
     receiver, sender = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=_worker, args=(sender, function, args, process_group))
+    ready = ctx.Event() if os.name == 'nt' and process_group else None
+    job = None
+    process = ctx.Process(target=_worker, args=(sender, function, args, process_group, ready))
     process.daemon = True
     started = False
     try:
         process.start()
         started = True
+        if ready is not None:
+            from .windows_job import WindowsJob
+            job = WindowsJob(process.pid)
+            ready.set()
         sender.close()
         deadline = time.monotonic() + timeout
         while True:
@@ -107,8 +115,10 @@ def run_bounded(function: Callable, args: tuple, timeout: float, *, process_grou
     finally:
         sender.close()
         receiver.close()
+        if job is not None:
+            job.close()
         if started:
-            if process_group:
+            if process_group and os.name != 'nt':
                 # Include any fixed-argv local subprocess on cancellation/timeout.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -121,3 +131,15 @@ def run_bounded(function: Callable, args: tuple, timeout: float, *, process_grou
                 process.kill()
                 process.join(0.5)
             process.close()
+
+
+def local_provider_class(mode='auto'):
+    import platform
+    from .local import MacOSLocalProvider, MockLocalProvider
+    from .windows import WindowsLocalProvider
+    if mode == 'auto':
+        mode = {'Windows': 'windows', 'Darwin': 'macos'}.get(platform.system(), 'mock')
+    choices = {'windows': WindowsLocalProvider, 'macos': MacOSLocalProvider, 'mock': MockLocalProvider}
+    if mode not in choices:
+        raise ValueError('invalid_local_provider')
+    return choices[mode]

@@ -695,7 +695,7 @@ Phase 5の汎用ファイル作成は `/task` 経由で承認が必要。LLMが�
 | command | 下記の構造化された固定commandのみ |
 | filter_files | 直前のdirectory listingを拡張子で絞り込む純粋処理 |
 
-既定は `--local-provider mock`。mockも許可フォルダ内のファイルは実際に読み書きするが、
+Phase 5時点の既定は `--local-provider mock`（Phase 5.1では下記の`auto`）。mockも許可フォルダ内のファイルは実際に読み書きするが、
 app起動・command・system infoはシミュレーションであり、GUIや外部サービスは使わない。
 テストでは一時フォルダを使用する。
 `--local-provider macos` で `/usr/bin/open` の引数配列によるfile/app起動・Finder表示を有効にする。
@@ -846,3 +846,94 @@ Phase 6前に扱う課題:
 
 常駐化・自律実行・scheduled task・任意shell・GUI自動操作・browser操作・remote PC・
 Gmail送信・Calendar書込み・credential管理・自己改変は追加していない。
+
+
+## Phase 5.1 — Windows対応
+
+既存のTask / Risk / Permission、Voice、Memory、Auditを共用し、Windows固有の
+WorkspaceとLocalProviderを追加。GUI mouse/keyboard、browser automation、daemon、
+wake word、自律実行、任意shell、admin/UAC、registry、scheduled taskは対象外。
+
+### 起動とProvider選択
+
+```text
+python -m personal_ai --notes-dir "C:\Users\YourName\Documents\AI Notes" --local-provider auto
+python -m personal_ai --notes-dir "C:\Users\YourName\Documents\AI Notes" --local-provider windows --allowed-repository "開発 Repo"
+```
+
+`auto`がCLI/API共通の既定。Windowsでは`WindowsLocalProvider`、macOSでは既存の
+`MacOSLocalProvider`、その他のOSでは`MockLocalProvider`を選択する。
+`--local-provider mock`でOS起動をシミュレーションできる（ファイル操作は実際に行う）。
+テストやデモでmockを必要とする場合は明示する。
+
+### 構成と操作
+
+- `FileLocalProvider`: 共通のPermission照合、リスク制約、操作ディスパッチ、結果検証。
+- `WindowsWorkspace`: Windowsファイル処理。`WindowsNotesWorkspace`は既存ノートツールの
+  拡張子制約と検索を提供する。macOSのdescriptor-relative処理は維持。
+- `WindowsLocalProvider`: list/read/create（ファイル・ディレクトリ）、copy/move/rename、
+  system info、固定アプリ起動、Explorer表示。転送対象は既存と同じ64 KiB以下のUTF-8通常ファイル。
+- `open_file`: `.txt` / `.md`を固定のNotepadで開く。ファイル関連付けから任意プログラムを起動しない。
+- `open_application`: `Notepad` / `Calculator`のみ。Windows APIで取得したSystem32を使う。
+- `reveal_in_explorer`: `.txt` / `.md`をExplorerで選択表示。
+  `資料 名.txtをExplorerで表示して` / `資料 名.txtをエクスプローラーで表示して`に対応。
+  Windows上では既存の`reveal_in_finder`もExplorerへ対応付ける。
+- MEDIUM操作は従来どおりTask単位の承認が必要。アプリ起動・Explorer表示・commandは
+  dispatchだけでは成功を検証できないため`unverified`とする。
+
+### Windowsパスとプロセス安全性
+
+許可ルートにはローカルdrive letter付きパスを設定し、操作にはその配下の相対パスを渡す。
+相対パス中の`/`と`\`の混在、日本語、空白を扱う。drive absolute / drive relative、
+UNC、device namespace、traversal、空要素、末尾ドット・空白、予約デバイス名、ADS、
+制御文字、wildcardは拒否する。リポジトリallowlistはWindows形式の大文字小文字正規化を行う。
+
+各祖先ディレクトリを`CreateFileW`で開き、reparse pointを追跡せず実ハンドルの属性を確認する。
+操作中は書き込み・削除共有を許さず保持し、祖先のjunction化・renameによる脱出を防ぐ。
+ファイルもsymlink / junction / その他のreparse point、および複数hardlinkを拒否する。
+root identityを再照合し、作成は排他的、move/renameは実ハンドル経由で上書きなし。
+OneDrive等のreparse pointを含むフォルダは拒否するため、通常のローカルフォルダを使う。
+
+Gitは`git status` / `git diff` / `git log` / `git branch`の完全一致のみ。
+Windowsで`pwd`、Python/Node version command、任意cmd.exe / PowerShellは許可しない。
+Git for Windowsの固定パス`C:\Program Files\Git\cmd\git.exe`を使い、PATH探索はしない。
+別配置の場合は現状`command_unavailable`または実行失敗となる。
+既存と共通のsnapshotポリシーでconfig / hooksを除去、gitdir / alternates / submodules等を拒否。
+最大1,000エントリ・16 MiB・深さ16・1ファイル4 MiB、出力stdout+stderrは64 KiB、実行は5秒まで。
+すべて引数配列・`shell=False`で実行する。
+
+Windowsではパイプの読み取りをサイズ制限付きキューで処理する。
+Task workerは実行開始前に親所有のJob Objectへ割り当て、終了・タイムアウト・キャンセル時に
+子プロセスごと終了する。Jobへの割当てに失敗した場合は実行を開始しない。
+明示的なGUI起動だけは起動後のアプリを維持するためJobの対象外。
+OSへのGUI dispatchは非同期なので、ハンドル解放後のローカル他プロセスによる変更や
+ウィンドウ表示状態までは保証しない。
+
+API仕様: [CreateFileW](https://learn.microsoft.com/ja-jp/windows/win32/api/fileapi/nf-fileapi-createfilew)、
+[Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)。
+
+### 検証
+
+```text
+python -m unittest discover -v
+python -m unittest tests.test_windows -v
+```
+
+macOSでの検証結果: 既存192件を維持し45件追加、計237件中231件成功・Windows専用6件skip。
+追加テスト単独も39件成功・6件skip。Windows実機での実行結果は未確認。
+
+追加テストはWindowsパスポリシー、Provider操作、Permission/Audit、固定argv、
+Git snapshot、出力制限を対象とする。Windowsネイティブ専用テストは他OSではskip。
+従来テストにはPOSIX固有APIやsymlink権限に依存する試験が含まれるため、
+Windows移行時にもmacOSでの従来スイート検証を併用する。
+
+Windows実機で確認する項目:
+
+1. 通常のローカルNTFSフォルダでネイティブ専用テストを含むWindowsスイートを実行。
+2. drive letter、大文字小文字違い、日本語・空白・混在slashで操作し、既存ファイルが上書きされないこと。
+3. junction / symlink / reparse pointの外部参照が拒否されること（symlink試験は作成権限がなければskip）。
+4. Notepad / Calculator起動、Explorer選択表示、ユーザー承認と`unverified`表示。
+5. 固定配置のGit for Windowsで4コマンドを実行し、元リポジトリに変更がないこと。
+6. タイムアウト・キャンセル時にGitと子プロセスが残らず、一時snapshotが削除されること。
+7. 既存Voice依存パッケージ・マイク・音声モデルのWindows動作、およびVoiceからも同じPermissionが適用されること。
+8. Memory / Auditの永続化、再起動、秘密本文を監査ログへ残さない既存ポリシー。

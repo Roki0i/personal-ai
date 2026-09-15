@@ -16,14 +16,14 @@ from .files import Workspace, FileDenied, MAX_BYTES, MAX_ENTRIES
 
 LOW = {'list_directory', 'read_file', 'list_applications', 'get_system_info', 'command', 'filter_files'}
 MEDIUM = {'create_file', 'create_directory', 'rename', 'copy', 'move', 'open_file',
-          'open_application', 'reveal_in_finder'}
+          'open_application', 'reveal_in_finder', 'reveal_in_explorer'}
 HIGH = {'delete', 'overwrite', 'terminate_process', 'shell', 'external_upload'}
 FIELDS = {
     'list_directory': {'path'}, 'read_file': {'path'}, 'create_file': {'path', 'content'},
     'create_directory': {'path'}, 'rename': {'source', 'destination'},
     'copy': {'source', 'destination'}, 'move': {'source', 'destination'},
     'open_file': {'path'}, 'open_application': {'application'}, 'reveal_in_finder': {'path'},
-    'get_system_info': set(), 'list_applications': set(), 'command': {'command', 'path'},
+    'reveal_in_explorer': {'path'}, 'get_system_info': set(), 'list_applications': set(), 'command': {'command', 'path'},
     'filter_files': {'suffix'},
 }
 VERSION_EXECUTABLES = {'python --version': ('/usr/bin/python3',),
@@ -72,7 +72,7 @@ def validate(action):
             raise ValueError('invalid_arguments')
     if name == 'command' and args['command'] not in COMMANDS:
         raise ValueError('command_denied')
-    if name == 'open_application' and args['application'] not in APPLICATIONS:
+    if name == 'open_application' and args['application'] not in set(APPLICATIONS) | {'Notepad', 'Calculator'}:
         raise ValueError('application_denied')
 
 
@@ -92,6 +92,18 @@ class LocalWorkspace(Workspace):
             return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
         finally:
             os.close(parent)
+
+    def check_directory(self, path):
+        fd = self.directory(path)
+        os.close(fd)
+
+    def exists(self, path):
+        parent, leaf = self.parent(path)
+        try:
+            try: os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError: return False
+            return True
+        finally: os.close(parent)
 
     def listing(self, path):
         fd = self.directory(path)
@@ -158,11 +170,22 @@ class LocalProvider(Protocol):
 
 
 class FileLocalProvider:
-    """Shared POSIX file implementation; native side effects supplied by adapters."""
+    """Shared permission, file action dispatch and verification; OS adapters supply I/O."""
 
     def __init__(self, root, identity, repositories=()):
         self.root, self.identity = str(root), identity
         self.repositories = tuple(repositories)
+
+    applications = APPLICATIONS
+
+    def workspace(self):
+        if os.name == 'nt':
+            from .windows import WindowsWorkspace
+            return WindowsWorkspace(self.root, self.identity)
+        return LocalWorkspace(self.root, self.identity)
+
+    def repository_key(self, path):
+        return path
 
     def execute(self, action, permission):
         validate(action)
@@ -174,7 +197,7 @@ class FileLocalProvider:
         # Risk is enforced here too; unsupported HIGH actions never reach an OS API.
         if classify(name) == 'HIGH':
             raise FileDenied('high_action_disabled')
-        ws = LocalWorkspace(self.root, self.identity)
+        ws = self.workspace()
         try:
             if name == 'list_directory': return ws.listing(args['path'])
             if name == 'read_file': return ws.read(args['path'])
@@ -184,19 +207,20 @@ class FileLocalProvider:
             if name == 'create_directory': return ws.mkdir(args['path'])
             if name in ('copy', 'move', 'rename'):
                 return ws.transfer(args['source'], args['destination'], name != 'copy')
-            if name in ('open_file', 'reveal_in_finder'):
+            if name in ('open_file', 'reveal_in_finder', 'reveal_in_explorer'):
                 # Only bounded text files can be opened; no scripts, apps or directories.
                 if Path(args['path']).suffix.lower() not in ('.md', '.txt'):
                     raise FileDenied('only_text_open_allowed')
                 ws.read(args['path'])
                 return self.open_resource(ws, name, args['path'])
-            if name == 'open_application': return self.open_app(args['application'])
-            if name == 'list_applications': return list(APPLICATIONS)
+            if name == 'open_application':
+                if args['application'] not in self.applications: raise FileDenied('application_denied')
+                return self.open_app(args['application'])
+            if name == 'list_applications': return list(self.applications)
             if name == 'get_system_info': return self.system_info()
             if name == 'command':
-                fd = ws.directory(args['path'])
-                os.close(fd)
-                if args['command'].startswith('git ') and args['path'] not in self.repositories:
+                ws.check_directory(args['path'])
+                if args['command'].startswith('git ') and self.repository_key(args['path']) not in {self.repository_key(p) for p in self.repositories}:
                     raise FileDenied('repository_denied')
                 return self.command(ws, args['command'], args['path'])
             raise FileDenied('action_denied')
@@ -210,24 +234,18 @@ class FileLocalProvider:
 
     def verify(self, action, result):
         name, args = action['name'], action['arguments']
-        ws = LocalWorkspace(self.root, self.identity)
+        ws = self.workspace()
         try:
             if name == 'create_directory':
-                fd = ws.directory(args['path'])
-                os.close(fd)
+                ws.check_directory(args['path'])
                 return True
             if name in ('create_file', 'copy', 'move', 'rename'):
                 path = args['path'] if name == 'create_file' else args['destination']
                 matched = digest(ws.read(path)) == result['sha256']
                 if name in ('move', 'rename'):
-                    parent, leaf = ws.parent(args['source'])
-                    try:
-                        try: os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-                        except FileNotFoundError: return matched
-                        return False
-                    finally: os.close(parent)
+                    return matched and not ws.exists(args['source'])
                 return matched
-            if name in ('open_file', 'open_application', 'reveal_in_finder', 'command'):
+            if name in ('open_file', 'open_application', 'reveal_in_finder', 'reveal_in_explorer', 'command'):
                 return False  # Dispatch/mock output is not evidence of OS state.
             if name == 'read_file': return digest(ws.read(args['path'])) == digest(result)
             if name == 'list_directory': return ws.listing(args['path']) == result
@@ -260,6 +278,7 @@ class MacOSLocalProvider(FileLocalProvider):
         return run_command(argv, cwd)
 
     def open_resource(self, ws, name, path):
+        if name == 'reveal_in_explorer': raise FileDenied('action_denied')
         # Validate every component again while holding the allowed root descriptor.
         # LaunchServices accepts pathnames, so a hostile concurrent local renamer
         # is outside this dispatch guarantee (see README).
@@ -313,6 +332,19 @@ def git_argv(command):
             '-c', 'protocol.allow=never', '-c', 'diff.renames=false'] + options[command]
 
 
+def skip_repository_entry(rel):
+    """Shared snapshot policy for POSIX and Windows walkers."""
+    control = tuple(part.casefold() for part in rel)
+    if len(rel) > 1 and control[-1] == '.git':
+        raise FileDenied('repository_indirection_denied')
+    if control in (('.git', 'config'), ('.git', 'config.worktree'), ('.git', 'hooks')):
+        return True
+    if control[-1] in ('.gitmodules', 'alternates', 'http-alternates', 'commondir', 'gitdir') or control[:2] in (
+            ('.git', 'modules'), ('.git', 'worktrees')):
+        raise FileDenied('repository_indirection_denied')
+    return False
+
+
 def snapshot_repository(root_fd, target):
     """Copy at most 1,000 regular files / 16 MiB; reject all link indirections.
 
@@ -331,14 +363,7 @@ def snapshot_repository(root_fd, target):
                 count += 1
                 if count > MAX_ENTRIES: raise FileDenied('repository_too_large')
                 rel = parts + (entry.name,)
-                control = tuple(part.casefold() for part in rel)
-                if parts and entry.name.casefold() == '.git':
-                    raise FileDenied('repository_indirection_denied')
-                if control in (('.git', 'config'), ('.git', 'config.worktree'), ('.git', 'hooks')):
-                    continue
-                if entry.name.casefold() in ('.gitmodules', 'alternates', 'http-alternates', 'commondir', 'gitdir') or control[:2] in (
-                        ('.git', 'modules'), ('.git', 'worktrees')):
-                    raise FileDenied('repository_indirection_denied')
+                if skip_repository_entry(rel): continue
                 info = entry.stat(follow_symlinks=False)
                 output = dest / entry.name
                 if stat.S_ISDIR(info.st_mode):
@@ -382,7 +407,7 @@ def run_command(argv, cwd=None):
     env = {'PATH': '/usr/bin:/bin', 'HOME': '/var/empty', 'LC_ALL': 'C',
            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
            'GIT_TERMINAL_PROMPT': '0', 'GIT_PAGER': 'cat', 'GIT_ATTR_NOSYSTEM': '1'}
-    process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+    process = subprocess.Popen(argv, shell=False, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output = bytearray()
     size = 0

@@ -13,7 +13,6 @@ from .models import Context, Persona, Reply, ToolCall
 from .runtime import OperationError, cancel_current, run_bounded
 from .storage import Store
 from .tools import SCHEMAS, Tools
-from .local import MockLocalProvider, MacOSLocalProvider
 from .tasks import TaskManager, route as route_task
 
 
@@ -21,7 +20,7 @@ class Assistant:
     def __init__(self, data_dir, notes_dir, persona_path=None, provider=None,
                  timeout=10.0, turn_timeout=30.0, max_tool_calls=4,
                  web_provider=None, calendar_provider=None, local_provider=None,
-                 local_mode="mock", allowed_repositories=()):
+                 local_mode="auto", allowed_repositories=()):
         if not all(math.isfinite(value) and value > 0 for value in (timeout, turn_timeout)):
             raise ValueError("timeout must be finite and positive")
         if not isinstance(max_tool_calls, int) or not 1 <= max_tool_calls <= 10:
@@ -29,6 +28,9 @@ class Assistant:
         data_input, notes_input = Path(data_dir).absolute(), Path(notes_dir).absolute()
         if data_input.is_symlink() or notes_input.is_symlink():
             raise ValueError("configured directories must not be symlinks")
+        if os.name == 'nt':
+            from .windows import check_configured_path
+            for configured in (data_input, notes_input): check_configured_path(configured)
         data, notes = data_input.resolve(), notes_input.resolve()
         if data == notes or data in notes.parents or notes in data.parents:
             raise ValueError("data and notes directories must not overlap")
@@ -39,6 +41,8 @@ class Assistant:
         database = data / "assistant.sqlite3"
         if database.is_symlink():
             raise ValueError("database must not be a symlink")
+        if os.name == 'nt':
+            check_configured_path(database)
         self.store = Store(database)
         os.chmod(database, 0o600)
         self.provider = provider if provider is not None else MockLLM()
@@ -47,11 +51,10 @@ class Assistant:
             self.tools = Tools(notes, self.store, timeout,
                                web_provider if web_provider is not None else MockWebSearchProvider(),
                                calendar_provider if calendar_provider is not None else MockCalendarProvider())
-            if local_mode not in ('mock', 'macos'):
-                raise ValueError('invalid_local_provider')
-            local = local_provider if local_provider is not None else (
-                MacOSLocalProvider if local_mode == 'macos' else MockLocalProvider)(
-                    notes, self.tools.identity, allowed_repositories)
+            from .runtime import local_provider_class
+            provider_class = local_provider_class(local_mode)
+            local = local_provider if local_provider is not None else provider_class(
+                notes, self.tools.identity, allowed_repositories)
             if local.root != str(notes) or local.identity != self.tools.identity:
                 raise ValueError('local_provider_must_use_allowed_folder')
             self.tasks = TaskManager(self.store, local, timeout, turn_timeout)

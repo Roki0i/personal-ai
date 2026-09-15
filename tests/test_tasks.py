@@ -50,7 +50,7 @@ class TaskTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
-        self.app = Assistant(self.root / 'data', self.root / 'notes', timeout=3,
+        self.app = Assistant(self.root / 'data', self.root / 'notes', timeout=3, local_mode='mock',
                              allowed_repositories=('repo',))
         self.notes = self.root / 'notes'
         self.provider = self.app.tasks.provider
