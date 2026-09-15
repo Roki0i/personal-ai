@@ -437,3 +437,135 @@ APIキー送信、ローカルファイル読み取り、権限変更を外部�
 検証: `python3 -m unittest discover -s tests -q`。
 実Webサービス、ページ全文取得、Calendar書き込み、Gmail、PC操作、shell Tool、任意ファイル参照、
 ブラウザー操作、wake word、daemon、自律処理・background実行は未実装。
+
+## Phase 4: Memory高度化
+
+Phase 1〜3のPersona、明示Memory、Conversation history、Tool permission、Audit、Voice、
+Web/Calendar読取を維持し、SQLite内のMemory管理を拡張した。外部サービス・追加依存は不要。
+PC操作、shell Tool、Gmail、Calendar書込み、常駐化、自律実行は追加していない。
+
+### Architecture / schema
+
+`Assistant → Store(MemoryStore) → SQLite` が唯一の保存経路。
+CLIと音声は共通の `handle()` を通り、LLM向けTool schemaにはMemory書込みを公開しない。
+通常チャットは関連Memoryと直近12発言だけをContextへ渡す。Web/Calendar要求は従来どおり
+Memory・履歴を渡さず、外部結果由来の会話も後続Contextとsummaryから除外する。
+
+既存DBは起動時に不足列を追加し、元のID・本文・日時を保持してexplicit memoryとして移行する。
+`memories` は以下を保持する。
+
+| 列 | 意味 |
+| --- | --- |
+| id | 永続ID、削除後も再利用しない |
+| type | explicit_memory / user_preference / fact / project_context / temporary_context / conversation_summary |
+| content | 最大4,000文字の本文 |
+| source | explicit_user_command / user_conversation / conversation_summary |
+| created_at / updated_at | UTC日時 |
+| last_accessed_at | 実際にretrievalで選択された最終日時、未使用はNULL |
+| confidence / importance | 0〜1、確信度と重要度。confidenceは真偽保証ではない |
+| expires_at | optional。temporary_contextではtimezone付き日時が必須 |
+| status | active / conflict / expired / superseded / forgotten |
+| provenance | JSON。origin、epoch、conversation_ids。任意の外部metadataは保存しない |
+| confirmed | 明示ユーザー操作で確認済みか |
+| claim_key | 同一論点の競合検出用キー。例: preferred_language |
+| fingerprint | NFKC・casefold・連続空白正規化後のSHA-256 |
+
+補助テーブルは `memory_conflicts`（双方のID・状態・日時）、`memory_blocks`（削除本文のhash）、
+`memory_policy`（自動保存停止フラグ）。操作監査は既存の `operations` を使用する。
+
+### Retrieval / scoring
+
+SQLiteからactive/conflict候補を読み、英数字単語・日本語の文字bigramでlexical検索する。
+語の重なりがないMemoryはimportanceが高くても除外する。互換性のため「記憶を教えて」
+「覚えていることは？」「確認」は限定的な記憶確認意図として扱う。この場合も取得上限は適用する。
+
+```text
+relevance = queryと本文の共通token数 / queryのtoken数
+recency = 1 / (1 + 更新からの日数 / 30)
+score = 5*relevance + importance + 0.5*recency + 0.5*type_weight + 2*confirmed
+```
+
+type_weightはexplicit=1、preference=.9、temporary=.8、project=.7、fact=.6、summary=.3。
+関連候補のうちconfirmedを第一優先、次にscore降順、同点はID順。
+既定最大6件・本文合計8,000文字。全件をLLMへ渡さない。
+`retrieval_reason` に各得点要素、score、重なり数、取得理由、確認要否を記録する。
+監査にはIDと数値理由だけを残し、query・本文・一致語は残さない。候補がゼロのDBでは
+取得処理はno-opになり、retrieveログも作らない。期限切れは取得前に除外しexpireを一度記録する。
+
+### Deduplication / conflict
+
+正規化完全一致のみ同一IDへまとめる。自動候補は明示Memoryの本文・importanceを上書きしない。
+自動候補をユーザーが明示追加した場合はconfirmedへ昇格する。
+意味が似ているだけの文章は自動統合しない。検索時にもfingerprint単位で重複を除外する。
+
+同一claim_keyで本文が違えば、sourceや日時が新しくても両方をconflictとして保持する。
+回答への投入を保留し、理由にconfirmation_requiredを付ける。CLI登録時にも確認方法を案内する。
+`/memory show ID` で双方の参照元・時刻・明示性を確認する。
+`/memory update ID 内容` はユーザーによる採用値指定として扱い、競合相手をsupersededにする。
+片方をforgetすることでも競合を解除できる。claim_keyのない自由文間の意味的矛盾は検出しない。
+
+### Summary / forget保証
+
+`/memory summarize` は古い安全なユーザー発言を最大4,000文字の抽出型summaryにまとめる。
+直近12発言、assistant、tool、Web/Calendar、secret検出対象、コマンド入力は対象外。
+元のconversation IDsとepochを保持し、同じ参照元を繰り返しsummary化しない。
+LLMで文章を再生成せず、検証可能な発言の連結を採用している。元会話のローカル保存は維持する。
+
+update/forgetはトランザクション内で次を行う。
+
+- 旧本文のfingerprintを禁止リストへ保存。
+- forget対象の本文・provenance・claim_keyを消し、forgottenのtombstoneを保持。
+- 全自動Memoryと全summaryの本文を消し、通常参照から除外。
+- epochを更新し、旧user/assistant履歴がContextへ戻らないようにする。
+- 自動保存をDB単位で停止。再起動後も継続し、言い換えや新しい参照元による自動復活も防ぐ。
+
+この保証は意図的に広い。無関係な自動Memoryも失われ、以降summary作成も拒否される。
+ユーザーが改めて明示的に「覚えて」した場合だけ再登録可能。
+元会話は従来仕様どおりDBに残り、物理消去やバックアップ消去を保証するものではない。
+新たに明示要求したWeb検索結果そのものに同じ事実が現れることは防げないが、Memoryへは保存しない。
+
+### Privacy / audit
+
+通常のチャットを自動的に恒久Memoryへ保存する抽出器は有効にしていない。
+ホスト内部の非明示登録APIは、現epochのuser発言の実在参照と本文の完全な抽出一致を必須にする。
+secret/password/API key/token/private keyのラベル・代表的な鍵形式・保存禁止表現を拒否する。
+保存禁止のユーザー発言は、後続の自動保存も停止する。Web/Calendar/assistantを参照元にした
+登録、外部source、自動confirmed指定、存在しない参照元、改変された抽出本文は拒否する。
+音声も同じポリシーを通る。文字列検出で無印のあらゆる秘密を判別できるわけではない。
+明示保存と既存Conversation historyはこの自動Memory禁止とは別の保存経路であり、暗号化は未実装。
+
+add/update/retrieve/conflict/expire/forgetを既存監査へ記録する。本文・query・claim_keyは入れず、
+エラーも固定コードとする。`/memory why` はこのプロセスの直近取得理由、`/logs` は永続監査。
+明示コマンドの開始/完了ログと、保存トランザクション内のイベントが別々に記録される。
+
+### CLI例
+
+```text
+覚えて 日本語で簡潔に回答する
+/memory add --type user_preference --importance 0.9 回答には具体例が欲しい
+/memory add --type project_context --claim-key current_project Personal AIのPhase 4を実装中
+/memory add --type temporary_context --expires-at 2026-09-15T18:00:00+09:00 今日の作業はMemory検証
+/memory list
+/memory search 回答の好み
+/memory show 1
+/memory why
+/memory update 1 日本語で要点と理由を回答する
+/memory forget 1
+/memory summarize
+```
+
+`--type / --importance / --claim-key / --expires-at` は本文の前に指定する。
+更新・forget後のsummaryは `automatic_memory_denied` になるため、summaryを試す場合は先に実行する。
+
+### 検証とPhase 5前の課題
+
+`python3 -m unittest discover -s tests -q` で、外部サービス・音声機器なしに全テストを実行可能。
+テスト総数は104件（既存67件＋Phase 4追加37件）。
+既存Phase 1〜3のテストは変更せず維持。Phase 4ではモデル移行、関連性・優先順位・重複・競合、
+expiry、summary参照と削除、privacy、外部データ境界、Voice、CLI、監査を追加検証する。
+
+残る課題は日本語lexical検索の精度評価、claim_keyなしの競合候補提示、ユーザー承認付きの
+意味的統合、より情報密度の高いsummary、限定的な自動保存再開の安全設計、ローカル履歴の
+物理削除と暗号化・バックアップ方針、大量Memory時の索引化。現状の候補走査はO(N)。
+Phase 5へ進む前に、特にforget後の自動保存停止という広い制限と、無印secretの扱いについて
+運用方針を固める必要がある。vector DB・cloud memoryや自律実行は今回の範囲外。

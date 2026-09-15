@@ -10,7 +10,12 @@ from .models import ToolCall
 HELP = """通常の入力: mock LLMと会話（外部通信なし）
 /memory add 内容             明示的な記憶を登録
 /memory list                 記憶一覧
-/memory update ID 内容       記憶を更新、旧会話コンテキストを無効化
+/memory search 検索語        関連記憶と取得理由
+/memory show ID              記憶の詳細・参照元・競合
+/memory why                  直近の取得理由（本文なし）
+/memory summarize            古い安全なユーザー発言を要約
+覚えて 内容                  /memory add と同じ
+/memory update ID 内容       明示更新（競合時はこの値を採用）、旧会話を無効化
 /memory forget ID|all        記憶を削除、旧会話コンテキストを無効化
 忘れて ID|all                /memory forget と同じ
 /search 検索語               許可フォルダのメモ検索
@@ -37,6 +42,8 @@ def render_tool(result):
 
 
 def handle(app, line):
+    if line.startswith("覚えて "):
+        line = "/memory add " + line[len("覚えて "):]
     if line.startswith("忘れて "):
         line = "/memory forget " + line[len("忘れて "):]
     if line.strip() == "忘れて":
@@ -53,8 +60,28 @@ def handle(app, line):
         action = parts[1]
         if action == "list" and len(parts) == 2:
             return json.dumps(app.memory("list"), ensure_ascii=False, indent=2)
+        if action in ("why", "summarize") and len(parts) == 2:
+            return json.dumps(app.memory(action), ensure_ascii=False, indent=2)
+        if action == "show" and len(parts) == 3:
+            return json.dumps(app.memory("show", memory_id=int(parts[2])), ensure_ascii=False, indent=2)
+        if action == "search" and len(parts) >= 3:
+            return json.dumps(app.memory("search", " ".join(parts[2:])), ensure_ascii=False, indent=2)
         if action == "add" and len(parts) >= 3:
-            return "記憶を登録しました: ID={}".format(app.memory("add", " ".join(parts[2:])))
+            attributes = {}
+            rest = parts[2:]
+            flags = {"--type": "memory_type", "--expires-at": "expires_at",
+                     "--claim-key": "claim_key", "--importance": "importance"}
+            while rest and rest[0].startswith("--"):
+                if rest[0] not in flags or len(rest) < 2:
+                    raise ValueError("memory_option_invalid")
+                name = flags[rest[0]]
+                attributes[name] = float(rest[1]) if name == "importance" else rest[1]
+                rest = rest[2:]
+            key = app.memory("add", " ".join(rest), **attributes)
+            answer = "記憶を登録しました: ID={}".format(key)
+            if app.store.show_memory(key)["status"] == "conflict":
+                answer += "。競合のため回答への利用を保留しました。/memory show {} で比較し、/memory update ID 内容 で採用する値を指定してください。".format(key)
+            return answer
         if action == "update" and len(parts) >= 4:
             memory_id = int(parts[2])
             app.memory("update", " ".join(parts[3:]), memory_id)

@@ -1,14 +1,17 @@
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .memory import MemoryStore
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-class Store:
+class Store(MemoryStore):
     def __init__(self, path: Path):
         self.db = sqlite3.connect(str(path), timeout=1.0)
         self.db.row_factory = sqlite3.Row
@@ -34,6 +37,8 @@ class Store:
             );
         """)
 
+        self.init_memory()
+
     def close(self):
         self.db.close()
 
@@ -42,6 +47,8 @@ class Store:
 
     def message(self, role, content, epoch=None):
         with self.db:
+            if role == "user" and re.search(r"(?i)保存(?:しない|禁止|しないで)|覚えないで|do not (?:store|remember)|don.t (?:store|remember)", content):
+                self.db.execute("UPDATE memory_policy SET automatic_disabled=1 WHERE id=1")
             self.db.execute(
                 "INSERT INTO conversations(epoch,role,content,created_at) VALUES (?,?,?,?)",
                 (self.epoch() if epoch is None else epoch, role, content, now()),
@@ -53,39 +60,6 @@ class Store:
             (self.epoch(), limit),
         ).fetchall()
         return [dict(row) for row in reversed(rows)]
-
-    def memories(self):
-        return [dict(row) for row in self.db.execute("SELECT * FROM memories ORDER BY id")]
-
-    def memory(self, action, content=None, memory_id=None):
-        if action in ("add", "update"):
-            if not isinstance(content, str) or not content.strip() or len(content) > 4000:
-                raise ValueError("memory_content_invalid")
-        with self.db:
-            if action == "add":
-                stamp = now()
-                cursor = self.db.execute(
-                    "INSERT INTO memories(content,source,created_at,updated_at) VALUES (?,?,?,?)",
-                    (content.strip(), "explicit_user_command", stamp, stamp),
-                )
-                return cursor.lastrowid
-            if action == "update":
-                cursor = self.db.execute(
-                    "UPDATE memories SET content=?,updated_at=? WHERE id=?",
-                    (content.strip(), now(), memory_id),
-                )
-            elif action == "forget":
-                if memory_id == "all":
-                    cursor = self.db.execute("DELETE FROM memories")
-                else:
-                    cursor = self.db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-            else:
-                raise ValueError("memory_action_invalid")
-            if cursor.rowcount == 0 and memory_id != "all":
-                raise ValueError("memory_not_found")
-            # Atomic invalidation: old user AND assistant messages never re-enter Context.
-            self.db.execute("UPDATE state SET epoch=epoch+1 WHERE id=1")
-            return memory_id
 
     def start_operation(self, name, metadata=None):
         with self.db:

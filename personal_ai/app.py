@@ -65,14 +65,25 @@ class Assistant:
     def close(self):
         self.store.close()
 
-    def memory(self, action, content=None, memory_id=None):
+    def memory(self, action, content=None, memory_id=None, **attributes):
         # Only explicit commands call this API. Memory is not an LLM tool.
         operation = self.store.start_operation("memory_" + action,
                                                {"memory_id": memory_id})
         try:
-            result = self.store.memories() if action == "list" else self.store.memory(
-                action, content, memory_id
-            )
+            if action == "add":
+                result = self.store.add_memory(content, **attributes)
+            elif action == "list":
+                result = self.store.memories()
+            elif action == "search":
+                result = self.store.retrieve_memories(content)
+            elif action == "show":
+                result = self.store.show_memory(memory_id)
+            elif action == "why":
+                result = self.store.last_retrieval
+            elif action == "summarize":
+                result = self.store.summarize_conversation()
+            else:
+                result = self.store.memory(action, content, memory_id)
             self.store.finish_operation(operation, "success")
             return result
         except ValueError as exc:
@@ -96,7 +107,7 @@ class Assistant:
             if type(adapter) in (MockWebSearchProvider, MockCalendarProvider):
                 external_permission = ExternalPermission(PrivacyClassification.CLOUD_SENDABLE,
                                                          provider=adapter.provider_id)
-        context = Context(self.persona, [] if request else self.store.memories(),
+        context = Context(self.persona, [] if request else self.store.retrieve_memories(message),
                           [] if request else self.store.history(), message, SCHEMAS)
         self.store.message("external_user" if request else "user", message, epoch)
         tool_count = 0
