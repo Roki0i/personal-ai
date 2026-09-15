@@ -284,10 +284,10 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM memory_conflicts WHERE status='pending'").fetchone()[0], 0)
         self.assertEqual([r['id'] for r in self.store.retrieve_memories('language')], [keys[0]])
 
-    def test_forget_cleans_conflict_links_to_invalidated_derived_memory(self):
+    def test_unrelated_forget_preserves_pending_conflict(self):
         key = self.app.memory('add', 'language Japanese', claim_key='language')
         self.automatic('language English', claim_key='language')
         other = self.app.memory('add', 'unrelated task')
         self.app.memory('forget', memory_id=other)
-        self.assertEqual(self.store.show_memory(key)['status'], 'active')
-        self.assertEqual([r['id'] for r in self.store.retrieve_memories('language')], [key])
+        self.assertEqual(self.store.show_memory(key)['status'], 'conflict')
+        self.assertEqual(self.store.retrieve_memories('language'), [])

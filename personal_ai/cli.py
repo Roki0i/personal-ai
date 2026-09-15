@@ -15,8 +15,8 @@ HELP = """通常の入力: mock LLMと会話（外部通信なし）
 /memory why                  直近の取得理由（本文なし）
 /memory summarize            古い安全なユーザー発言を要約
 覚えて 内容                  /memory add と同じ
-/memory update ID 内容       明示更新（競合時はこの値を採用）、旧会話を無効化
-/memory forget ID|all        記憶を削除、旧会話コンテキストを無効化
+/memory update ID 内容       明示更新（競合時はこの値を採用）、関連する旧会話を無効化
+/memory forget ID|all        記憶を削除、関連する会話コンテキストを無効化
 忘れて ID|all                /memory forget と同じ
 /search 検索語               許可フォルダのメモ検索
 /read 相対パス               UTF-8の .md/.txt を読み取り

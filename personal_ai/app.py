@@ -107,9 +107,14 @@ class Assistant:
             if type(adapter) in (MockWebSearchProvider, MockCalendarProvider):
                 external_permission = ExternalPermission(PrivacyClassification.CLOUD_SENDABLE,
                                                          provider=adapter.provider_id)
+        history_rows = [] if request else self.store.history_rows()
         context = Context(self.persona, [] if request else self.store.retrieve_memories(message),
-                          [] if request else self.store.history(), message, SCHEMAS)
-        self.store.message("external_user" if request else "user", message, epoch)
+                          [{k: row[k] for k in ('role', 'content')} for row in history_rows], message, SCHEMAS)
+        conversation_ids = [row['id'] for row in history_rows]
+        memory_ids = [row['id'] for row in context.memories]
+        user_id = self.store.message("external_user" if request else "user", message, epoch,
+                                     conversation_ids=conversation_ids)
+
         tool_count = 0
         operation = None
         try:
@@ -172,5 +177,6 @@ class Assistant:
                 self.store.finish_operation(operation, "cancelled", "cancelled")
             answer = "処理をキャンセルしました。実行済みの操作は /logs で確認してください。"
         # Save into the original epoch even if another process forgot a memory.
-        self.store.message("external_assistant" if request else "assistant", answer, epoch)
+        self.store.message("external_assistant" if request else "assistant", answer, epoch,
+                           conversation_ids=conversation_ids + [user_id], memory_ids=memory_ids)
         return answer

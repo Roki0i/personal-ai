@@ -45,21 +45,34 @@ class Store(MemoryStore):
     def epoch(self):
         return self.db.execute("SELECT epoch FROM state WHERE id=1").fetchone()[0]
 
-    def message(self, role, content, epoch=None):
+    def message(self, role, content, epoch=None, *, conversation_ids=(), memory_ids=()):
         with self.db:
             if role == "user" and re.search(r"(?i)保存(?:しない|禁止|しないで)|覚えないで|do not (?:store|remember)|don.t (?:store|remember)", content):
                 self.db.execute("UPDATE memory_policy SET automatic_disabled=1 WHERE id=1")
-            self.db.execute(
-                "INSERT INTO conversations(epoch,role,content,created_at) VALUES (?,?,?,?)",
-                (self.epoch() if epoch is None else epoch, role, content, now()),
+            current = self.epoch()
+            version = current if epoch is None else epoch
+            stale = version != current or self.suppressed(content)
+            for table, refs in (('conversations', conversation_ids), ('memories', memory_ids)):
+                for ref in refs:
+                    parent = self.db.execute('SELECT status FROM ' + table + ' WHERE id=?', (ref,)).fetchone()
+                    stale = stale or parent is None or parent['status'] != 'active'
+            cursor = self.db.execute(
+                "INSERT INTO conversations(epoch,role,content,created_at,status) VALUES (?,?,?,?,?)",
+                (version, role, content, now(), 'stale' if stale else 'active'),
             )
+            self.link_sources('conversation', cursor.lastrowid,
+                              conversation_ids=conversation_ids, memory_ids=memory_ids)
+            return cursor.lastrowid
 
-    def history(self, limit=12):
+    def history_rows(self, limit=12):
         rows = self.db.execute(
-            "SELECT role,content FROM conversations WHERE epoch=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?",
+            "SELECT id,role,content FROM conversations WHERE status='active' AND epoch=? AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?",
             (self.epoch(), limit),
         ).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def history(self, limit=12):
+        return [{k: row[k] for k in ('role', 'content')} for row in self.history_rows(limit)]
 
     def start_operation(self, name, metadata=None):
         with self.db:

@@ -125,20 +125,10 @@ pyproject.toml  パッケージ情報とCLIエントリポイント
 
 ### Memoryと「忘れて」
 
-SQLiteには、本文、ID、出典（明示ユーザーコマンド）、登録・更新日時を保存します。
-Memoryの更新・削除と同じトランザクション内で、会話の `epoch` を進めます。
-LLMが参照できる履歴は現在のepochのみなので、削除済みの内容が古いユーザー発言や
-アシスタント回答から復活しません。再起動後もこの区切りは保持されます。
-削除後もIDを再利用しません。
-
-この方式では、1件の更新・削除でも**それ以前の会話全体がLLMの参照対象から外れます**。
-残っている明示Memoryは引き続き参照できます。
-
-「忘れて」は、Memoryを削除して会話コンテキストから除外する機能です。
-過去の会話原文はローカルSQLiteに履歴として残ります。
-既存メモ、Persona、バックアップ、ユーザーが再入力した情報の削除は対象外です。
-メモに同じ事実を保存してあれば、ユーザーの読み取り依頼で再取得できます。
-履歴・ツール結果の自動検索によるMemory再登録は実装していません。
+Memoryの更新・削除は、本文を持たないsuppressionと参照元の依存関係を使って、
+影響するMemory・summary・会話を同じSQLiteトランザクションで無効化します。
+安全な会話と無関係なMemoryは維持します。詳細と保証範囲は末尾のPhase 4.1を参照してください。
+削除後もIDを再利用しません。履歴の物理消去、既存メモ・Persona・バックアップの削除は対象外です。
 
 ### ファイル権限
 
@@ -511,18 +501,8 @@ type_weightはexplicit=1、preference=.9、temporary=.8、project=.7、fact=.6�
 元のconversation IDsとepochを保持し、同じ参照元を繰り返しsummary化しない。
 LLMで文章を再生成せず、検証可能な発言の連結を採用している。元会話のローカル保存は維持する。
 
-update/forgetはトランザクション内で次を行う。
-
-- 旧本文のfingerprintを禁止リストへ保存。
-- forget対象の本文・provenance・claim_keyを消し、forgottenのtombstoneを保持。
-- 全自動Memoryと全summaryの本文を消し、通常参照から除外。
-- epochを更新し、旧user/assistant履歴がContextへ戻らないようにする。
-- 自動保存をDB単位で停止。再起動後も継続し、言い換えや新しい参照元による自動復活も防ぐ。
-
-この保証は意図的に広い。無関係な自動Memoryも失われ、以降summary作成も拒否される。
-ユーザーが改めて明示的に「覚えて」した場合だけ再登録可能。
-元会話は従来仕様どおりDBに残り、物理消去やバックアップ消去を保証するものではない。
-新たに明示要求したWeb検索結果そのものに同じ事実が現れることは防げないが、Memoryへは保存しない。
+Phase 4時点のDB全体停止方式は、Phase 4.1のscoped invalidationへ置き換えています。
+更新・forget後も安全な元発言からsummaryを作成できます。下記Phase 4.1を参照してください。
 
 ### Privacy / audit
 
@@ -555,17 +535,92 @@ add/update/retrieve/conflict/expire/forgetを既存監査へ記録する。本�
 ```
 
 `--type / --importance / --claim-key / --expires-at` は本文の前に指定する。
-更新・forget後のsummaryは `automatic_memory_denied` になるため、summaryを試す場合は先に実行する。
+更新・forget後も、安全な未要約の元発言があればsummaryを作成できます。
 
-### 検証とPhase 5前の課題
+## Phase 4.1: Memoryの安全な再開
 
-`python3 -m unittest discover -s tests -q` で、外部サービス・音声機器なしに全テストを実行可能。
-テスト総数は104件（既存67件＋Phase 4追加37件）。
-既存Phase 1〜3のテストは変更せず維持。Phase 4ではモデル移行、関連性・優先順位・重複・競合、
-expiry、summary参照と削除、privacy、外部データ境界、Voice、CLI、監査を追加検証する。
+### forget / update architecture
 
-残る課題は日本語lexical検索の精度評価、claim_keyなしの競合候補提示、ユーザー承認付きの
-意味的統合、より情報密度の高いsummary、限定的な自動保存再開の安全設計、ローカル履歴の
-物理削除と暗号化・バックアップ方針、大量Memory時の索引化。現状の候補走査はO(N)。
-Phase 5へ進む前に、特にforget後の自動保存停止という広い制限と、無印secretの扱いについて
-運用方針を固める必要がある。vector DB・cloud memoryや自律実行は今回の範囲外。
+- `source_edges` は `(parent_kind, parent_id) → (child_kind, child_id)` の依存関係。
+  conversation → Memory/summary、Memory → assistant回答、履歴 → 後続会話を記録する。
+  チャットでは実際に渡した直近履歴と取得Memoryを記録し、外部参照は別roleのまま保持する。
+- forget/updateは `BEGIN IMMEDIATE` 内でsuppression保存、依存先の推移的無効化、
+  既知の派生表現のコピーの無効化、競合解消、epoch更新、監査をまとめて確定する。
+- `conversations.status=stale` は履歴・抽出・summaryの対象外。
+  派生Memory/summaryは `stale` にし本文とclaim_keyを消す。数値の出典は再生成の追跡用に残す。
+  forget対象は本文・provenance・claim_keyを消した `forgotten` tombstoneにする。
+- epochは進行中の処理を拒否する世代番号として維持する。安全な会話だけ新epochへ移す。
+  古いepochで到着した発言はstaleになり、自動抽出には最新epochの要求を必須とする。
+- updateは旧値と競合の不採用値をsuppressionに追加し、対象IDを新しいcanonicalな
+  `explicit_memory` に置き換える。confirmed=1、旧期限を解除し、旧revisionの依存辺を切り離す。
+  旧値・不採用値・その派生物はretrievalから除外する。別の競合を無関係なforgetで解消しない。
+- forget/updateは `automatic_disabled` を設定しない。「保存禁止」という明示指示の停止は維持する。
+  `forget all` はMemoryが空でも既存会話を無効化するが、その後の安全な新規保存を停止しない。
+
+### Tombstone / suppression
+
+本文を保持する代わりに、NFKC・casefold・空白正規化後のSHA-256を保存する。
+
+| テーブル | 保存情報・用途 |
+| --- | --- |
+| memory_blocks | 対象と既知の派生本文のdigest。正規化完全一致を拒否 |
+| suppression_phrases | digestと正規化文字数。文章中に埋め込まれた既知の本文も拒否 |
+| suppression_terms | 対象本文の英数字単語・日本語bigramのdigest。部分引用や語順変更を保守的に拒否 |
+| source_edges | 種別と数値IDのみ。語句が異なっていても既知の派生経路を遮断 |
+
+派生summaryの全単語を新たな禁止語にすると、その中の無関係な元発言まで使えなくなるため、
+派生本文はphrase digestを保存する。自動登録は候補だけでなく各元発言についても検証する。
+監査・tombstone・suppression・依存辺へsecret本文や任意metadataを入れない。
+ハッシュは暗号化ではなく、低エントロピーの語句は辞書照合で推測され得る。
+
+### Summary regeneration
+
+summaryは引き続きLLMを使わない、最大4,000文字の元発言の連結。
+activeなuser発言のうち、suppression・secret・保存禁止・コマンドを除き、
+activeなsummaryに未収録の発言から再生成する。assistant/Web/Calendarは参照元として拒否する。
+
+例えば `Python Alpha` と `gardening roses` を含むsummaryで前者をforgetすると、
+旧summaryをstaleにし、独立した安全な元発言 `gardening roses` から新summaryを作れる。
+無効な元発言の一部分を切り出して安全だと推測する処理は行わない。
+有効なsummaryの収録済みIDはepochをまたいで維持し、再生成の重複を防ぐ。
+
+### 既存DBの移行
+
+列・テーブル追加は再実行可能。Phase 4以前の会話は依存情報が不足するため、同epochの
+直前12発言と、assistantについては既存Memoryを保守的な参照候補として補完する。
+旧epochの会話を復活させない。
+
+旧方式で停止済みのDBは、保存された会話からすべての削除fingerprintの元表現を照合でき、
+「保存禁止」の指示がない場合に限りsuppressionを構築して再開する。
+元表現が失われている場合や停止理由を安全に解除できない場合は、旧停止を維持する。
+新方式で行ったforget/updateではこの移行上の停止は発生しない。
+
+### 保証範囲と残る制約
+
+- **保証する範囲**：記録された元発言・依存グラフからの復活、既知の本文の正規化一致・
+  埋め込みコピー、保持した語句digestと一致する再入力。音声も同じ保存経路を使う。
+- **任意の意味的な言い換えまでは保証しない**：依存関係のない新規ユーザー発言で、
+  既知の表現・語句と一致しない同義語や別言語を使われると、ハッシュでは同一事実と識別できない。
+  この意味で「派生した内容を一切再保存しない」という無条件の保証は未達。
+  LLMによる要約・自動言い換え抽出は導入していない。
+- 語句の一致は安全側に判定するため、共通語を持つ無関係な自動候補も除外することがある。
+  例えば旧値と新値が同じ単語を含むと、新値を含む自動summaryも除外し得る。
+  canonicalな明示Memoryのretrievalにはこの語句フィルタを適用しない。
+- 履歴の文脈に依存した後続発言は、内容が無関係に見えても保守的にstaleになる。
+  無効化単位は発言全体。独立した安全な元発言の保存・summaryは継続できる。
+- 通常チャットでの自動抽出器は引き続き無効。今回継続可能にしたのはホスト内部の
+  検証付き自動保存APIとsummary生成。明示的な再学習は従来どおり可能。
+- 元会話はローカルDBに残る。物理削除、暗号化、バックアップ消去、外部Provider独自の記憶は対象外。
+  suppressionの本文走査と依存グラフの無効化は、大量データ向けの最適化をしていない。
+
+### 検証
+
+`python3 -m unittest discover -s tests -q`
+
+実行結果: **127件すべて成功**（約35秒、外部サービス・音声機器なし）。
+Phase 4の104テストに23件を追加。旧仕様を検証していた1件は、無関係なforgetで別の競合を
+解消しない期待値へ更新した。その他の既存103件は維持している。
+追加テストは継続保存、混在summary再生成、正規化・部分引用・既知の派生コピー、更新、
+再起動、voice、Web/Calendar境界、世代競合、トランザクションrollback、privacy、DB移行を検証する。
+
+Phase 5のPC操作、shell Tool、daemon、自律実行は追加していない。
